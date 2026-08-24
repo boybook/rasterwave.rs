@@ -7,6 +7,8 @@ audio stream back into image rows. The same state machines power streaming and
 one-shot APIs, so a WAV file, a sound-card callback, and a future Node.js worker
 all observe the same protocol behavior.
 
+![Rasterwave SSTV and radiofax codec preview](docs/preview.jpg)
+
 The crate is library-first: it does not open audio devices, key a transmitter,
 spawn threads, or depend on an async runtime.
 
