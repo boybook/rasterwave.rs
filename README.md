@@ -64,11 +64,17 @@ under `rasterwave::fax`.
 
 ## Install
 
-Until the first crates.io release, depend on the Git repository:
+Add the published crate with Cargo:
+
+```bash
+cargo add rasterwave
+```
+
+Or declare the dependency directly:
 
 ```toml
 [dependencies]
-rasterwave = { git = "https://github.com/boybook/rasterwave.rs" }
+rasterwave = "0.1"
 ```
 
 The minimum supported Rust version is 1.85.
