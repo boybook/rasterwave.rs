@@ -19,6 +19,10 @@ spawn threads, or depend on an async runtime.
 - Streaming SSTV decoder with automatic VIS detection, sync-timing candidates,
   frequency-offset tracking, bounded acquisition history, and immediate row
   events.
+- Optional immediate decoding starts any caller-selected SSTV mode or fixed
+  radiofax profile with the first PCM sample. Later SSTV sync pulses still
+  correct timing and frequency, while missing headers or weak signals do not
+  block row output.
 - VIS candidates are checked against subsequent sync timing before an image is
   started. Ambiguous no-VIS timing reports candidates instead of inventing an
   exact mode.

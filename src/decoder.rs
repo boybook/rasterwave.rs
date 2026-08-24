@@ -77,6 +77,10 @@ pub enum AbortReason {
 /// Runtime decoder policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecoderConfig {
+    /// Start decoding the configured manual mode with the first PCM sample.
+    /// Sync pulses remain available for clock and phase correction, but they
+    /// are not required to begin or continue emitting image rows.
+    pub immediate_decode: bool,
     /// Detect standard calibration and VIS headers.
     pub detect_vis: bool,
     /// Infer mode candidates from repeated sync timing when VIS is absent.
@@ -91,6 +95,7 @@ pub struct DecoderConfig {
 impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
+            immediate_decode: false,
             detect_vis: true,
             detect_sync_timing: true,
             manual_mode: None,
@@ -964,6 +969,11 @@ impl SstvDecoder {
                 "minimum_signal_level must be finite and non-negative",
             ));
         }
+        if config.immediate_decode && config.manual_mode.is_none() {
+            return Err(Error::InvalidConfiguration(
+                "immediate_decode requires manual_mode",
+            ));
+        }
         Ok(Self {
             input_sample_rate,
             config,
@@ -1184,6 +1194,19 @@ impl SstvDecoder {
         let mut confirmed_vis: Option<(SstvMode, DetectionSource, f32, [SyncPulse; 3], f64)> = None;
         let mut sync_lost: Option<(u64, SstvMode, Option<u32>)> = None;
 
+        if self.config.immediate_decode && matches!(self.state, DecoderState::Searching) {
+            let mode = self
+                .config
+                .manual_mode
+                .expect("immediate_decode manual mode validated at construction");
+            events += self.begin_image(mode, DetectionSource::Manual, 0.0, sink);
+            if let DecoderState::Receiving(receive) = &mut self.state {
+                receive.started = true;
+                receive.timeline_start = Some(absolute);
+                receive.sync_lines_confirmed = receive.radio_line_count();
+            }
+        }
+
         match &mut self.state {
             DecoderState::Searching => {
                 if self.config.detect_vis
@@ -1343,6 +1366,9 @@ impl SstvDecoder {
                 }
                 if let Some(pulse) = pulse {
                     receive.on_sync(pulse, &self.history);
+                    if self.config.immediate_decode {
+                        receive.sync_lines_confirmed = receive.radio_line_count();
+                    }
                 }
                 let allow_unconfirmed_final =
                     self.signal_level_ema >= self.config.minimum_signal_level.max(0.0005);
@@ -1355,10 +1381,11 @@ impl SstvDecoder {
                     });
                     events += 1;
                     self.state = DecoderState::Searching;
-                } else if receive.sync_is_lost(absolute)
-                    || (self.config.minimum_signal_level > 0.0
-                        && absolute.saturating_sub(self.last_signal_sample)
-                            > samples(SIGNAL_LOSS_SECONDS) as u64)
+                } else if !self.config.immediate_decode
+                    && (receive.sync_is_lost(absolute)
+                        || (self.config.minimum_signal_level > 0.0
+                            && absolute.saturating_sub(self.last_signal_sample)
+                                > samples(SIGNAL_LOSS_SECONDS) as u64))
                 {
                     sync_lost = Some((receive.image_id, receive.mode, receive.last_emitted_row));
                 }

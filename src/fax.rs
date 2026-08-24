@@ -515,6 +515,11 @@ pub fn encode_fax(image: GrayImage, spec: FaxSpec, sample_rate: u32) -> Result<V
 /// Radiofax decoder policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FaxDecoderConfig {
+    /// Start raster decoding immediately with the configured IOC and line
+    /// rate. This bypasses APT/phasing acquisition and keeps decoding through
+    /// low signal levels so receivers can join an in-progress transmission.
+    /// Both `ioc` and `lpm` must be configured when enabled.
+    pub immediate_decode: bool,
     /// Force IOC, or detect it from APT start modulation.
     pub ioc: Option<FaxIoc>,
     /// Force line rate, or infer a common rate from phasing lines.
@@ -548,6 +553,7 @@ pub struct FaxDecoderConfig {
 impl Default for FaxDecoderConfig {
     fn default() -> Self {
         Self {
+            immediate_decode: false,
             ioc: None,
             lpm: None,
             modulation: FaxModulation::WMO_FM,
@@ -1090,6 +1096,11 @@ impl FaxDecoder {
     pub fn new(input_sample_rate: u32, config: FaxDecoderConfig) -> Result<Self> {
         validate_rate(input_sample_rate)?;
         validate_modulation(config.modulation, input_sample_rate.min(WORK_SAMPLE_RATE))?;
+        if config.immediate_decode && (config.ioc.is_none() || config.lpm.is_none()) {
+            return Err(Error::InvalidConfiguration(
+                "immediate_decode requires configured ioc and lpm",
+            ));
+        }
         if config.am_full_scale <= 0.0 || !config.am_full_scale.is_finite() {
             return Err(Error::InvalidConfiguration(
                 "am_full_scale must be finite and positive",
@@ -1194,8 +1205,9 @@ impl FaxDecoder {
             ..
         } = state
         {
-            if stop_started_at.is_none()
-                && self.signal_level_ema >= self.config.minimum_signal_level
+            if self.config.immediate_decode
+                || (stop_started_at.is_none()
+                    && self.signal_level_ema >= self.config.minimum_signal_level)
             {
                 raster.levels.extend(stop_hold);
                 events += emit_available_fax_lines(
@@ -1297,7 +1309,38 @@ impl FaxDecoder {
         self.level_history.push(self.working_sample, level);
         let mut events = 0;
 
-        let state = std::mem::replace(&mut self.state, FaxDecodeState::Searching);
+        let mut state = std::mem::replace(&mut self.state, FaxDecodeState::Searching);
+        if self.config.immediate_decode && matches!(state, FaxDecodeState::Searching) {
+            let ioc = self
+                .config
+                .ioc
+                .expect("immediate_decode IOC validated at construction");
+            let lpm = self
+                .config
+                .lpm
+                .expect("immediate_decode LPM validated at construction");
+            let mut spec = FaxSpec::standard(ioc, lpm);
+            spec.modulation = self.config.modulation;
+            let page_id = self.next_page_id;
+            self.next_page_id = self.next_page_id.wrapping_add(1).max(1);
+            sink.on_event(FaxDecodeEventRef::PageStarted { page_id, spec });
+            events += 1;
+            let line_period_samples = lpm.line_seconds() * f64::from(WORK_SAMPLE_RATE);
+            state = FaxDecodeState::Receiving {
+                spec,
+                page_id,
+                raster: FaxRasterState {
+                    line_index: 0,
+                    line_period_samples,
+                    next_line_deadline: line_period_samples,
+                    scheduled_line_samples: 0,
+                    levels: Vec::with_capacity(line_period_samples.ceil() as usize),
+                    line: vec![0; ioc.width() as usize],
+                },
+                stop_started_at: None,
+                stop_hold: VecDeque::new(),
+            };
+        }
         self.state = match state {
             FaxDecodeState::Searching => {
                 let detected_ioc = signal_present
@@ -1526,56 +1569,21 @@ impl FaxDecoder {
                 mut stop_started_at,
                 mut stop_hold,
             } => {
-                let signal_lost = self.working_sample.saturating_sub(self.last_signal_sample)
-                    > work_samples(f64::from(self.config.signal_loss_seconds)) as u64;
-                if signal_lost {
-                    sink.on_event(FaxDecodeEventRef::PageCompleted {
+                if self.config.immediate_decode {
+                    raster.levels.push(level);
+                    events += emit_available_fax_lines(
                         page_id,
-                        lines: raster.line_index,
-                        partial: true,
-                    });
-                    events += 1;
-                    self.reset_fax_acquisition();
-                    FaxDecodeState::Searching
-                } else {
-                    stop_hold.push_back(level);
-                    let stop_detected = signal_present
-                        && modulation_hz
-                            .is_some_and(|frequency| (frequency - STOP_HZ as f32).abs() < 25.0);
-                    if stop_detected {
-                        let evidence_start = self
-                            .modulation_detector
-                            .control_run_start(STOP_HZ, 8)
-                            .unwrap_or(self.working_sample);
-                        stop_started_at.get_or_insert(evidence_start);
-                    } else {
-                        stop_started_at = None;
-                    }
-                    let stop_confirmed = stop_started_at.is_some_and(|started| {
-                        self.working_sample.saturating_sub(started)
-                            >= work_samples(f64::from(self.config.stop_confirm_seconds)) as u64
-                    });
-                    if stop_confirmed {
-                        if let Some(stop_start) = stop_started_at {
-                            let oldest = self
-                                .working_sample
-                                .saturating_add(1)
-                                .saturating_sub(stop_hold.len() as u64);
-                            let image_prefix = stop_start.saturating_sub(oldest) as usize;
-                            for _ in 0..image_prefix.min(stop_hold.len()) {
-                                if let Some(value) = stop_hold.pop_front() {
-                                    raster.levels.push(value);
-                                }
-                            }
-                            events += emit_available_fax_lines(
-                                page_id,
-                                &mut raster,
-                                self.config.max_lines,
-                                false,
-                                true,
-                                sink,
-                            );
-                        }
+                        &mut raster,
+                        self.config.max_lines,
+                        false,
+                        false,
+                        sink,
+                    );
+                    let maxed = self
+                        .config
+                        .max_lines
+                        .is_some_and(|max| raster.line_index >= max);
+                    if maxed {
                         sink.on_event(FaxDecodeEventRef::PageCompleted {
                             page_id,
                             lines: raster.line_index,
@@ -1585,27 +1593,65 @@ impl FaxDecoder {
                         self.reset_fax_acquisition();
                         FaxDecodeState::Searching
                     } else {
-                        if stop_started_at.is_none() && signal_present {
-                            let guard = work_samples(MODULATION_WINDOW_SECONDS + 0.05);
-                            while stop_hold.len() > guard {
-                                if let Some(value) = stop_hold.pop_front() {
-                                    raster.levels.push(value);
-                                }
-                            }
-                            events += emit_available_fax_lines(
-                                page_id,
-                                &mut raster,
-                                self.config.max_lines,
-                                false,
-                                false,
-                                sink,
-                            );
+                        FaxDecodeState::Receiving {
+                            spec,
+                            page_id,
+                            raster,
+                            stop_started_at,
+                            stop_hold,
                         }
-                        let maxed = self
-                            .config
-                            .max_lines
-                            .is_some_and(|max| raster.line_index >= max);
-                        if maxed {
+                    }
+                } else {
+                    let signal_lost = self.working_sample.saturating_sub(self.last_signal_sample)
+                        > work_samples(f64::from(self.config.signal_loss_seconds)) as u64;
+                    if signal_lost {
+                        sink.on_event(FaxDecodeEventRef::PageCompleted {
+                            page_id,
+                            lines: raster.line_index,
+                            partial: true,
+                        });
+                        events += 1;
+                        self.reset_fax_acquisition();
+                        FaxDecodeState::Searching
+                    } else {
+                        stop_hold.push_back(level);
+                        let stop_detected = signal_present
+                            && modulation_hz
+                                .is_some_and(|frequency| (frequency - STOP_HZ as f32).abs() < 25.0);
+                        if stop_detected {
+                            let evidence_start = self
+                                .modulation_detector
+                                .control_run_start(STOP_HZ, 8)
+                                .unwrap_or(self.working_sample);
+                            stop_started_at.get_or_insert(evidence_start);
+                        } else {
+                            stop_started_at = None;
+                        }
+                        let stop_confirmed = stop_started_at.is_some_and(|started| {
+                            self.working_sample.saturating_sub(started)
+                                >= work_samples(f64::from(self.config.stop_confirm_seconds)) as u64
+                        });
+                        if stop_confirmed {
+                            if let Some(stop_start) = stop_started_at {
+                                let oldest = self
+                                    .working_sample
+                                    .saturating_add(1)
+                                    .saturating_sub(stop_hold.len() as u64);
+                                let image_prefix = stop_start.saturating_sub(oldest) as usize;
+                                for _ in 0..image_prefix.min(stop_hold.len()) {
+                                    if let Some(value) = stop_hold.pop_front() {
+                                        raster.levels.push(value);
+                                    }
+                                }
+                                events += emit_available_fax_lines(
+                                    page_id,
+                                    &mut raster,
+                                    self.config.max_lines,
+                                    false,
+                                    true,
+                                    sink,
+                                );
+                            }
                             sink.on_event(FaxDecodeEventRef::PageCompleted {
                                 page_id,
                                 lines: raster.line_index,
@@ -1615,12 +1661,43 @@ impl FaxDecoder {
                             self.reset_fax_acquisition();
                             FaxDecodeState::Searching
                         } else {
-                            FaxDecodeState::Receiving {
-                                spec,
-                                page_id,
-                                raster,
-                                stop_started_at,
-                                stop_hold,
+                            if stop_started_at.is_none() && signal_present {
+                                let guard = work_samples(MODULATION_WINDOW_SECONDS + 0.05);
+                                while stop_hold.len() > guard {
+                                    if let Some(value) = stop_hold.pop_front() {
+                                        raster.levels.push(value);
+                                    }
+                                }
+                                events += emit_available_fax_lines(
+                                    page_id,
+                                    &mut raster,
+                                    self.config.max_lines,
+                                    false,
+                                    false,
+                                    sink,
+                                );
+                            }
+                            let maxed = self
+                                .config
+                                .max_lines
+                                .is_some_and(|max| raster.line_index >= max);
+                            if maxed {
+                                sink.on_event(FaxDecodeEventRef::PageCompleted {
+                                    page_id,
+                                    lines: raster.line_index,
+                                    partial: false,
+                                });
+                                events += 1;
+                                self.reset_fax_acquisition();
+                                FaxDecodeState::Searching
+                            } else {
+                                FaxDecodeState::Receiving {
+                                    spec,
+                                    page_id,
+                                    raster,
+                                    stop_started_at,
+                                    stop_hold,
+                                }
                             }
                         }
                     }
@@ -2064,5 +2141,59 @@ mod tests {
             Err(Error::NonFiniteSample)
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn immediate_decode_starts_and_emits_rows_without_apt_or_signal_gate() {
+        let mut decoder = FaxDecoder::new(
+            WORK_SAMPLE_RATE,
+            FaxDecoderConfig {
+                immediate_decode: true,
+                ioc: Some(FaxIoc::Ioc576),
+                lpm: Some(FaxLpm::LPM_120),
+                minimum_signal_level: 1.0,
+                minimum_carrier_coherence: 2.0,
+                ..FaxDecoderConfig::default()
+            },
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let samples = vec![0.0; (FaxLpm::LPM_120.line_seconds() * 12_000.0) as usize + 2];
+
+        decoder.process_into(&samples, &mut events).unwrap();
+
+        assert!(matches!(
+            events.first(),
+            Some(FaxDecodeEvent::PageStarted { spec, .. })
+                if spec.ioc == FaxIoc::Ioc576 && spec.lpm == FaxLpm::LPM_120
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FaxDecodeEvent::LineReady { line_index: 0, .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FaxDecodeEvent::PageCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn immediate_fax_decode_requires_fixed_ioc_and_lpm() {
+        for config in [
+            FaxDecoderConfig {
+                immediate_decode: true,
+                ioc: Some(FaxIoc::Ioc576),
+                ..FaxDecoderConfig::default()
+            },
+            FaxDecoderConfig {
+                immediate_decode: true,
+                lpm: Some(FaxLpm::LPM_120),
+                ..FaxDecoderConfig::default()
+            },
+        ] {
+            assert!(FaxDecoder::new(WORK_SAMPLE_RATE, config).is_err());
+        }
     }
 }

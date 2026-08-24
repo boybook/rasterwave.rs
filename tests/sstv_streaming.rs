@@ -666,3 +666,58 @@ fn every_registered_vis_mode_completes_its_declared_raster() {
         );
     }
 }
+
+#[test]
+fn immediate_decode_starts_and_emits_a_row_for_every_mode_without_sync() {
+    for spec in SSTV_MODES {
+        let mode = spec.mode;
+        let mut decoder = SstvDecoder::new(
+            12_000,
+            DecoderConfig {
+                immediate_decode: true,
+                detect_vis: false,
+                detect_sync_timing: false,
+                manual_mode: Some(mode),
+                minimum_signal_level: 1.0,
+            },
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let samples = vec![0.0; (spec.line_seconds * 12_000.0).ceil() as usize + 2];
+
+        decoder.process_into(&samples, &mut events).unwrap();
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(DecodeEvent::ImageStarted {
+                    mode: started,
+                    detection: DetectionSource::Manual,
+                    ..
+                }) if *started == mode
+            ),
+            "mode {mode:?} did not start immediately: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                DecodeEvent::LineReady { mode: decoded, .. } if *decoded == mode
+            )),
+            "mode {mode:?} did not emit a row without sync"
+        );
+    }
+}
+
+#[test]
+fn immediate_decode_requires_a_manual_mode() {
+    assert!(
+        SstvDecoder::new(
+            12_000,
+            DecoderConfig {
+                immediate_decode: true,
+                ..DecoderConfig::default()
+            }
+        )
+        .is_err()
+    );
+}
