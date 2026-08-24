@@ -11,9 +11,12 @@ mod color;
 mod decoder;
 mod encoder;
 mod error;
+mod fax_paper;
 mod image;
 mod mode;
 mod oscillator;
+mod paper;
+mod sstv_paper;
 mod vis;
 
 pub mod fax;
@@ -25,8 +28,16 @@ pub use decoder::{
 };
 pub use encoder::{EncodeOptions, EncoderProgress, SstvEncoder};
 pub use error::{Error, Result};
+pub use fax_paper::{
+    FaxPaperConfig, FaxPaperDecoder, FaxPaperEvent, FaxPaperEventRef, FaxPaperMode, FaxPaperSink,
+};
 pub use image::{GrayImage, Rgb, RgbImage};
 pub use mode::{Channel, ColorLayout, ModeSpec, ModeStatus, SSTV_MODES, ScanLayout, SstvMode};
+pub use paper::PaperBoundaryKind;
+pub use sstv_paper::{
+    SstvPaperConfig, SstvPaperDecoder, SstvPaperEvent, SstvPaperEventRef, SstvPaperMode,
+    SstvPaperSink,
+};
 
 /// Encode one complete SSTV image into mono `f32` PCM.
 ///

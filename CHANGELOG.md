@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-08-24
+
+- Add first-class `SstvPaperDecoder` and `FaxPaperDecoder` orchestration APIs.
+- Print fallback raster rows immediately while protocol acquisition runs in
+  parallel, with monotonic paper rows and explicit trusted boundaries.
+- Complete SSTV captures only after a trusted start plus nominal image height,
+  and fax captures only after confirmed APT stop; paper output continues.
+- Add automatic fax IOC/LPM and FM/AM acquisition paths, manual mismatch
+  reporting, discontinuity dividers, and encode/decode integration coverage.
+
 ## 0.1.1 - 2026-08-24
 
 - Add opt-in immediate decoding for every SSTV mode when `manual_mode` is set.

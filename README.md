@@ -23,6 +23,9 @@ spawn threads, or depend on an async runtime.
   radiofax profile with the first PCM sample. Later SSTV sync pulses still
   correct timing and frequency, while missing headers or weak signals do not
   block row output.
+- Dedicated continuous-paper decoders print fallback snow immediately, detect
+  protocol boundaries in parallel, and keep emitting rows after a trusted
+  SSTV image or APT-delimited fax page completes.
 - VIS candidates are checked against subsequent sync timing before an image is
   started. Ambiguous no-VIS timing reports candidates instead of inventing an
   exact mode.
@@ -40,7 +43,7 @@ spawn threads, or depend on an async runtime.
 
 ## Status
 
-Rasterwave is an early `0.1` API intended for integration and interoperability
+Rasterwave is an early `0.2` API intended for integration and interoperability
 work. The encoder and decoder share one immutable mode catalog.
 
 The primary built-in profiles currently include:
@@ -78,7 +81,7 @@ Or declare the dependency directly:
 
 ```toml
 [dependencies]
-rasterwave = "0.1"
+rasterwave = "0.2"
 ```
 
 The minimum supported Rust version is 1.85.
@@ -162,6 +165,41 @@ audio silently would corrupt line timing.
 For queues and language bindings, use `DecodeEventRef::to_owned()` or
 `SstvDecoder::process_into()`. `encode_sstv()` and `decode_sstv()` provide
 one-shot helpers built on the same streaming engines.
+
+## Continuous Receiver Paper
+
+`SstvPaperDecoder` and `FaxPaperDecoder` are presentation-neutral orchestration
+layers over the framed protocol decoders. They separate three concerns:
+continuous fallback raster output, protocol acquisition, and trusted capture
+ranges. Automatic SSTV starts as Robot 36 Color; automatic fax starts as
+IOC576/120 LPM/FM and evaluates FM and AM acquisition paths in parallel.
+
+```rust
+use rasterwave::{SstvPaperConfig, SstvPaperDecoder, SstvPaperEventRef};
+
+fn receive(chunks: &[&[f32]]) -> rasterwave::Result<()> {
+    let mut decoder = SstvPaperDecoder::new(48_000, SstvPaperConfig::default())?;
+    for chunk in chunks {
+        decoder.push_f32(chunk, &mut |event: SstvPaperEventRef<'_>| {
+            match event {
+                SstvPaperEventRef::Boundary { kind, line_index, .. } => {
+                    println!("divider {kind:?} before row {line_index}");
+                }
+                SstvPaperEventRef::LineReady { line_index, pixels, .. } => {
+                    println!("paper row {line_index}: {} px", pixels.len());
+                }
+                _ => {}
+            }
+        })?;
+    }
+    Ok(())
+}
+```
+
+Paper row indices never reset at nominal image height. A trusted VIS/sync or
+APT/phasing boundary opens a capture range; completion closes only that range
+while fallback paper output continues. Signal loss and discontinuity emit a
+divider but never masquerade as successful protocol completion.
 
 ## Radiofax
 
