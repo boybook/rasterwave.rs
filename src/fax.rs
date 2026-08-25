@@ -16,7 +16,7 @@ const STOP_HZ: f64 = 450.0;
 const MODULATION_WINDOW_SECONDS: f64 = 0.2;
 const MODULATION_EVALUATION_SECONDS: f64 = 0.01;
 const MODULATION_DROPOUT_SECONDS: f64 = 0.25;
-const MAX_PHASING_STARTS: usize = 8;
+const MAX_PHASING_STARTS: usize = 64;
 const MAX_EOF_FILTER_DELAY_SAMPLES: usize = 16;
 
 /// Radiofax index of cooperation.
@@ -163,6 +163,98 @@ pub struct FaxSpec {
     pub trailing_black_seconds: f32,
     /// Fraction of each line reserved as the dead sector.
     pub dead_sector_fraction: f32,
+}
+
+/// Automatic radiofax clock-recovery policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FaxClockRecoveryMode {
+    /// Keep the nominal LPM clock and do not publish automatic corrections.
+    Off,
+    /// Recover line period and horizontal phase from phasing and image timing.
+    #[default]
+    Auto,
+}
+
+/// Evidence used for a radiofax clock estimate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaxClockSource {
+    /// Nominal LPM timing is active.
+    Nominal,
+    /// APT phasing lines established timing.
+    Phasing,
+    /// The repeated image dead sector refined timing.
+    DeadSector,
+    /// A caller supplied an additive adjustment.
+    Manual,
+}
+
+/// Radiofax clock-recovery lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaxClockStatus {
+    /// No trusted timing evidence is available.
+    Nominal,
+    /// Phasing or image timing is being accumulated.
+    Acquiring,
+    /// A trusted initial clock is active.
+    Locked,
+    /// Image timing is refining an existing clock.
+    Tracking,
+    /// Timing evidence weakened; the last trusted model is frozen.
+    Degraded,
+}
+
+/// One affine control point for correcting a nominal radiofax paper raster.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaxClockCalibrationPoint {
+    /// Monotonic calibration revision.
+    pub revision: u32,
+    /// Paper line at which `phase_pixels` is defined.
+    pub reference_line: u64,
+    /// Horizontal correction at the reference line. Positive moves content right.
+    pub phase_pixels: f32,
+    /// Estimated source clock correction in parts per million.
+    pub clock_ppm: f32,
+    /// Normalized confidence in `0.0..=1.0`.
+    pub confidence: f32,
+    /// Evidence source.
+    pub source: FaxClockSource,
+    /// Recovery lifecycle at this point.
+    pub status: FaxClockStatus,
+}
+
+/// Additive operator adjustment applied while correcting a paper segment.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FaxPaperCorrection {
+    /// Constant horizontal adjustment. Positive moves content right.
+    pub phase_pixels: f32,
+    /// Additional linear slant correction in parts per million.
+    pub clock_ppm: f32,
+}
+
+impl Default for FaxClockCalibrationPoint {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            reference_line: 0,
+            phase_pixels: 0.0,
+            clock_ppm: 0.0,
+            confidence: 0.0,
+            source: FaxClockSource::Nominal,
+            status: FaxClockStatus::Nominal,
+        }
+    }
+}
+
+/// Current radiofax clock snapshot.
+pub type FaxClockState = FaxClockCalibrationPoint;
+
+/// Coordinate basis used by a decoded radiofax row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaxRasterBasis {
+    /// The row has already been cut with the recovered clock.
+    Calibrated,
+    /// The row uses the stable nominal LPM paper grid and needs calibration metadata.
+    NominalPaper,
 }
 
 impl FaxSpec {
@@ -520,6 +612,10 @@ pub struct FaxDecoderConfig {
     /// low signal levels so receivers can join an in-progress transmission.
     /// Both `ioc` and `lpm` must be configured when enabled.
     pub immediate_decode: bool,
+    /// Automatic line-clock and horizontal-phase recovery.
+    pub clock_recovery: FaxClockRecoveryMode,
+    /// Coordinate basis used for emitted rows.
+    pub raster_basis: FaxRasterBasis,
     /// Force IOC, or detect it from APT start modulation.
     pub ioc: Option<FaxIoc>,
     /// Force line rate, or infer a common rate from phasing lines.
@@ -554,6 +650,8 @@ impl Default for FaxDecoderConfig {
     fn default() -> Self {
         Self {
             immediate_decode: false,
+            clock_recovery: FaxClockRecoveryMode::Auto,
+            raster_basis: FaxRasterBasis::Calibrated,
             ioc: None,
             lpm: None,
             modulation: FaxModulation::WMO_FM,
@@ -587,6 +685,8 @@ pub enum FaxDecodeEventRef<'a> {
         lpm: FaxLpm,
         /// Output width.
         width: u32,
+        /// Recovered timing model.
+        clock: FaxClockCalibrationPoint,
     },
     /// Image pixels begin after phasing.
     PageStarted {
@@ -594,6 +694,8 @@ pub enum FaxDecodeEventRef<'a> {
         page_id: u64,
         /// Active fax specification.
         spec: FaxSpec,
+        /// Timing model used to start this raster.
+        clock: FaxClockCalibrationPoint,
     },
     /// One grayscale raster line is ready.
     LineReady {
@@ -603,6 +705,8 @@ pub enum FaxDecodeEventRef<'a> {
         line_index: u32,
         /// Grayscale pixels, valid until the callback returns.
         pixels: &'a [u8],
+        /// Coordinate basis of `pixels`.
+        basis: FaxRasterBasis,
     },
     /// Page reception ended.
     PageCompleted {
@@ -637,6 +741,8 @@ pub enum FaxDecodeEvent {
         lpm: FaxLpm,
         /// Width.
         width: u32,
+        /// Recovered timing model.
+        clock: FaxClockCalibrationPoint,
     },
     /// Page image started.
     PageStarted {
@@ -644,6 +750,8 @@ pub enum FaxDecodeEvent {
         page_id: u64,
         /// Active specification.
         spec: FaxSpec,
+        /// Timing model used to start this raster.
+        clock: FaxClockCalibrationPoint,
     },
     /// One owned grayscale row.
     LineReady {
@@ -653,6 +761,8 @@ pub enum FaxDecodeEvent {
         line_index: u32,
         /// Grayscale pixels.
         pixels: Vec<u8>,
+        /// Coordinate basis of `pixels`.
+        basis: FaxRasterBasis,
     },
     /// Page ended.
     PageCompleted {
@@ -675,23 +785,36 @@ impl FaxDecodeEventRef<'_> {
     pub fn to_owned(&self) -> FaxDecodeEvent {
         match self {
             Self::AptDetected { ioc } => FaxDecodeEvent::AptDetected { ioc: *ioc },
-            Self::PhasingLocked { ioc, lpm, width } => FaxDecodeEvent::PhasingLocked {
+            Self::PhasingLocked {
+                ioc,
+                lpm,
+                width,
+                clock,
+            } => FaxDecodeEvent::PhasingLocked {
                 ioc: *ioc,
                 lpm: *lpm,
                 width: *width,
+                clock: *clock,
             },
-            Self::PageStarted { page_id, spec } => FaxDecodeEvent::PageStarted {
+            Self::PageStarted {
+                page_id,
+                spec,
+                clock,
+            } => FaxDecodeEvent::PageStarted {
                 page_id: *page_id,
                 spec: *spec,
+                clock: *clock,
             },
             Self::LineReady {
                 page_id,
                 line_index,
                 pixels,
+                basis,
             } => FaxDecodeEvent::LineReady {
                 page_id: *page_id,
                 line_index: *line_index,
                 pixels: pixels.to_vec(),
+                basis: *basis,
             },
             Self::PageCompleted {
                 page_id,
@@ -734,7 +857,7 @@ enum FaxDecodeState {
         ioc: FaxIoc,
         tracker: PhasingTracker,
         lpm: Option<FaxLpm>,
-        measured_line_samples: Option<f64>,
+        clock_fit: Option<PhasingClockFit>,
         lock_reported: bool,
         phasing_started_at: u64,
     },
@@ -755,6 +878,36 @@ struct FaxRasterState {
     scheduled_line_samples: u64,
     levels: Vec<u8>,
     line: Vec<u8>,
+    basis: FaxRasterBasis,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhasingClockFit {
+    period_samples: f64,
+    phase_sample: f64,
+    confidence: f32,
+}
+
+impl PhasingClockFit {
+    fn nearest_grid_sample(self, target: u64) -> u64 {
+        let index = ((target as f64 - self.phase_sample) / self.period_samples).round();
+        (self.phase_sample + index * self.period_samples)
+            .round()
+            .max(0.0) as u64
+    }
+
+    fn calibration(self, lpm: FaxLpm) -> FaxClockCalibrationPoint {
+        let nominal = lpm.line_seconds() * f64::from(WORK_SAMPLE_RATE);
+        FaxClockCalibrationPoint {
+            revision: 1,
+            reference_line: 0,
+            phase_pixels: 0.0,
+            clock_ppm: (((self.period_samples / nominal) - 1.0) * 1_000_000.0) as f32,
+            confidence: self.confidence,
+            source: FaxClockSource::Phasing,
+            status: FaxClockStatus::Locked,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -770,6 +923,8 @@ struct PhasingTracker {
     previous_black: Option<bool>,
     white_started_at: Option<u64>,
     valid_cycles: u8,
+    invalid_cycles: u8,
+    invalidated: bool,
 }
 
 impl PhasingTracker {
@@ -790,7 +945,7 @@ impl PhasingTracker {
         level: u8,
         sample: u64,
         expected_lpm: Option<FaxLpm>,
-    ) -> Option<(FaxLpm, f64)> {
+    ) -> Option<(FaxLpm, PhasingClockFit)> {
         let black = match self.previous_black {
             Some(true) => level < 160,
             Some(false) => level <= 96,
@@ -832,22 +987,28 @@ impl PhasingTracker {
                 self.black_starts.pop_front();
             }
             self.valid_cycles = self.valid_cycles.saturating_add(1);
+            self.invalid_cycles = 0;
         } else {
-            self.black_starts.clear();
-            self.black_starts.push_back(sample);
-            self.valid_cycles = 0;
+            self.invalid_cycles = self.invalid_cycles.saturating_add(1);
+            if self.invalid_cycles >= 3 {
+                self.black_starts.clear();
+                self.black_starts.push_back(sample);
+                self.valid_cycles = 0;
+                self.invalid_cycles = 0;
+                self.invalidated = true;
+            }
         }
         self.white_started_at = None;
         self.locked(expected_lpm)
     }
 
-    fn locked(&self, expected_lpm: Option<FaxLpm>) -> Option<(FaxLpm, f64)> {
+    fn locked(&self, expected_lpm: Option<FaxLpm>) -> Option<(FaxLpm, PhasingClockFit)> {
         if self.valid_cycles < 4 || self.black_starts.len() < 5 {
             return None;
         }
-        let period = fitted_period(&self.black_starts)?;
-        let rate = expected_lpm.or_else(|| infer_lpm_from_period(period))?;
-        Some((rate, period))
+        let fit = fitted_phasing_clock(&self.black_starts)?;
+        let rate = expected_lpm.or_else(|| infer_lpm_from_period(fit.period_samples))?;
+        (fit.confidence >= 0.45).then_some((rate, fit))
     }
 
     fn first_start(&self) -> Option<u64> {
@@ -856,6 +1017,10 @@ impl PhasingTracker {
 
     fn last_start(&self) -> Option<u64> {
         self.black_starts.back().copied()
+    }
+
+    fn take_invalidated(&mut self) -> bool {
+        std::mem::take(&mut self.invalidated)
     }
 }
 
@@ -1323,7 +1488,12 @@ impl FaxDecoder {
             spec.modulation = self.config.modulation;
             let page_id = self.next_page_id;
             self.next_page_id = self.next_page_id.wrapping_add(1).max(1);
-            sink.on_event(FaxDecodeEventRef::PageStarted { page_id, spec });
+            let clock = FaxClockCalibrationPoint::default();
+            sink.on_event(FaxDecodeEventRef::PageStarted {
+                page_id,
+                spec,
+                clock,
+            });
             events += 1;
             let line_period_samples = lpm.line_seconds() * f64::from(WORK_SAMPLE_RATE);
             state = FaxDecodeState::Receiving {
@@ -1336,6 +1506,7 @@ impl FaxDecoder {
                     scheduled_line_samples: 0,
                     levels: Vec::with_capacity(line_period_samples.ceil() as usize),
                     line: vec![0; ioc.width() as usize],
+                    basis: self.config.raster_basis,
                 },
                 stop_started_at: None,
                 stop_hold: VecDeque::new(),
@@ -1391,7 +1562,7 @@ impl FaxDecoder {
                         started_at: self.working_sample,
                     }
                 } else if let Some(ioc) = self.config.ioc {
-                    if let Some((rate, period)) =
+                    if let Some((rate, fit)) =
                         self.search_phasing
                             .process(level, self.working_sample, self.config.lpm)
                     {
@@ -1402,7 +1573,7 @@ impl FaxDecoder {
                             ioc,
                             tracker,
                             lpm: Some(rate),
-                            measured_line_samples: Some(period),
+                            clock_fit: Some(fit),
                             lock_reported: false,
                             phasing_started_at: started_at,
                         }
@@ -1440,7 +1611,7 @@ impl FaxDecoder {
                             ioc,
                             tracker: PhasingTracker::new(level, self.working_sample),
                             lpm: self.config.lpm,
-                            measured_line_samples: None,
+                            clock_fit: None,
                             lock_reported: false,
                             phasing_started_at: last_transition,
                         }
@@ -1457,7 +1628,7 @@ impl FaxDecoder {
                 ioc,
                 mut tracker,
                 mut lpm,
-                mut measured_line_samples,
+                mut clock_fit,
                 mut lock_reported,
                 phasing_started_at,
             } => {
@@ -1477,18 +1648,29 @@ impl FaxDecoder {
                     self.reset_fax_acquisition();
                     FaxDecodeState::Searching
                 } else {
-                    if let Some((rate, period)) =
+                    if let Some((rate, fit)) =
                         tracker.process(level, self.working_sample, self.config.lpm)
                     {
                         lpm = Some(rate);
-                        measured_line_samples = Some(period);
+                        clock_fit = Some(fit);
                     }
-                    if let (Some(rate), Some(period)) = (lpm, measured_line_samples) {
+                    if tracker.take_invalidated() {
+                        clock_fit = None;
+                        lock_reported = false;
+                    }
+                    if let (Some(rate), Some(fit)) = (lpm, clock_fit) {
+                        let nominal_period = rate.line_seconds() * f64::from(WORK_SAMPLE_RATE);
+                        let clock = if self.config.clock_recovery == FaxClockRecoveryMode::Auto {
+                            fit.calibration(rate)
+                        } else {
+                            FaxClockCalibrationPoint::default()
+                        };
                         if !lock_reported {
                             sink.on_event(FaxDecodeEventRef::PhasingLocked {
                                 ioc,
                                 lpm: rate,
                                 width: ioc.width(),
+                                clock,
                             });
                             events += 1;
                             lock_reported = true;
@@ -1501,16 +1683,23 @@ impl FaxDecoder {
                             });
                         let pattern_ended = standard_page_start.is_none()
                             && tracker.last_start().is_some_and(|last| {
-                                self.working_sample.saturating_sub(last) as f64 > period * 1.2
+                                self.working_sample.saturating_sub(last) as f64
+                                    > fit.period_samples * 1.2
                             });
                         let timed_end =
                             standard_page_start.is_some_and(|start| self.working_sample >= start);
                         if timed_end || pattern_ended {
-                            let page_start = standard_page_start.unwrap_or_else(|| {
+                            let nominal_page_start = standard_page_start.unwrap_or_else(|| {
                                 tracker.last_start().map_or(self.working_sample, |last| {
-                                    last.saturating_add(period.round() as u64)
+                                    last.saturating_add(fit.period_samples.round() as u64)
                                 })
                             });
+                            let page_start =
+                                if self.config.clock_recovery == FaxClockRecoveryMode::Auto {
+                                    fit.nearest_grid_sample(nominal_page_start)
+                                } else {
+                                    nominal_page_start
+                                };
                             let mut spec = FaxSpec::standard(ioc, rate);
                             spec.modulation = self.config.modulation;
                             spec.phasing_seconds =
@@ -1520,20 +1709,34 @@ impl FaxDecoder {
                                 });
                             let page_id = self.next_page_id;
                             self.next_page_id = self.next_page_id.wrapping_add(1).max(1);
-                            sink.on_event(FaxDecodeEventRef::PageStarted { page_id, spec });
+                            sink.on_event(FaxDecodeEventRef::PageStarted {
+                                page_id,
+                                spec,
+                                clock,
+                            });
                             events += 1;
-                            let mut levels = Vec::with_capacity(period.ceil() as usize);
+                            let line_period_samples = if self.config.raster_basis
+                                == FaxRasterBasis::NominalPaper
+                                || self.config.clock_recovery == FaxClockRecoveryMode::Off
+                            {
+                                nominal_period
+                            } else {
+                                fit.period_samples
+                            };
+                            let mut levels =
+                                Vec::with_capacity(line_period_samples.ceil() as usize);
                             self.level_history.copy_from(page_start, &mut levels);
                             FaxDecodeState::Receiving {
                                 spec,
                                 page_id,
                                 raster: FaxRasterState {
                                     line_index: 0,
-                                    line_period_samples: period,
-                                    next_line_deadline: period,
+                                    line_period_samples,
+                                    next_line_deadline: line_period_samples,
                                     scheduled_line_samples: 0,
                                     levels,
                                     line: vec![0; ioc.width() as usize],
+                                    basis: self.config.raster_basis,
                                 },
                                 stop_started_at: None,
                                 stop_hold: VecDeque::with_capacity(work_samples(
@@ -1545,7 +1748,7 @@ impl FaxDecoder {
                                 ioc,
                                 tracker,
                                 lpm,
-                                measured_line_samples,
+                                clock_fit,
                                 lock_reported,
                                 phasing_started_at,
                             }
@@ -1555,7 +1758,7 @@ impl FaxDecoder {
                             ioc,
                             tracker,
                             lpm,
-                            measured_line_samples,
+                            clock_fit,
                             lock_reported,
                             phasing_started_at,
                         }
@@ -1730,6 +1933,91 @@ pub fn decode_fax(
     Ok(output)
 }
 
+/// Correct a nominal-grid grayscale fax paper using clock calibration points.
+///
+/// The paper is treated as one continuous one-dimensional raster so a shear
+/// may sample across adjacent row boundaries without introducing a seam.
+pub fn correct_fax_paper(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    start_line: u64,
+    calibration: &[FaxClockCalibrationPoint],
+    adjustment: FaxPaperCorrection,
+) -> Result<Vec<u8>> {
+    let expected = width as usize * height as usize;
+    if width == 0 || height == 0 || pixels.len() != expected {
+        return Err(Error::InvalidConfiguration(
+            "fax paper dimensions do not match the grayscale buffer",
+        ));
+    }
+    if !adjustment.phase_pixels.is_finite() || !adjustment.clock_ppm.is_finite() {
+        return Err(Error::InvalidConfiguration(
+            "fax paper correction must be finite",
+        ));
+    }
+    if calibration.iter().any(|point| {
+        !point.phase_pixels.is_finite()
+            || !point.clock_ppm.is_finite()
+            || !point.confidence.is_finite()
+    }) {
+        return Err(Error::InvalidConfiguration(
+            "fax clock calibration must be finite",
+        ));
+    }
+    let mut points = calibration.to_vec();
+    points.sort_by_key(|point| (point.reference_line, point.revision));
+    let mut output = vec![255; expected];
+    let row_width = f64::from(width);
+    for row in 0..height as usize {
+        let line = start_line + row as u64;
+        let mut phase = calibration_phase(&points, line, row_width);
+        phase += f64::from(adjustment.phase_pixels)
+            + (line.saturating_sub(start_line) as f64
+                * f64::from(adjustment.clock_ppm)
+                * row_width
+                / 1_000_000.0);
+        for column in 0..width as usize {
+            let target = row * width as usize + column;
+            let source = target as f64 - phase;
+            if source < 0.0 || source > (pixels.len() - 1) as f64 {
+                continue;
+            }
+            let left = source.floor() as usize;
+            let right = (left + 1).min(pixels.len() - 1);
+            let fraction = source - left as f64;
+            output[target] = (f64::from(pixels[left])
+                + (f64::from(pixels[right]) - f64::from(pixels[left])) * fraction)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok(output)
+}
+
+fn calibration_phase(points: &[FaxClockCalibrationPoint], line: u64, width: f64) -> f64 {
+    let Some(first) = points.first() else {
+        return 0.0;
+    };
+    if line < first.reference_line {
+        return f64::from(first.phase_pixels);
+    }
+    let index = points.partition_point(|point| point.reference_line <= line);
+    let left = points[index.saturating_sub(1)];
+    if let Some(right) = points.get(index).copied() {
+        let span = right
+            .reference_line
+            .saturating_sub(left.reference_line)
+            .max(1) as f64;
+        let progress = line.saturating_sub(left.reference_line) as f64 / span;
+        return f64::from(left.phase_pixels)
+            + (f64::from(right.phase_pixels) - f64::from(left.phase_pixels)) * progress;
+    }
+    f64::from(left.phase_pixels)
+        + line.saturating_sub(left.reference_line) as f64 * f64::from(left.clock_ppm) * width
+            / 1_000_000.0
+}
+
 fn emit_available_fax_lines(
     page_id: u64,
     raster: &mut FaxRasterState,
@@ -1767,6 +2055,7 @@ fn emit_available_fax_lines(
             page_id,
             line_index: raster.line_index,
             pixels: &raster.line,
+            basis: raster.basis,
         });
         events += 1;
         raster.line_index += 1;
@@ -1777,26 +2066,58 @@ fn emit_available_fax_lines(
     events
 }
 
-fn fitted_period(starts: &VecDeque<u64>) -> Option<f64> {
+fn fitted_phasing_clock(starts: &VecDeque<u64>) -> Option<PhasingClockFit> {
     if starts.len() < 2 {
         return None;
     }
-    let first = *starts.front()? as f64;
-    let mean_x = (starts.len() - 1) as f64 * 0.5;
-    let mean_y = starts
+    let mut intervals: Vec<f64> = starts
         .iter()
-        .map(|start| *start as f64 - first)
-        .sum::<f64>()
-        / starts.len() as f64;
-    let mut covariance = 0.0;
-    let mut variance = 0.0;
-    for (index, start) in starts.iter().enumerate() {
-        let x = index as f64 - mean_x;
-        let y = *start as f64 - first - mean_y;
-        covariance += x * y;
-        variance += x * x;
+        .zip(starts.iter().skip(1))
+        .map(|(left, right)| right.saturating_sub(*left) as f64)
+        .collect();
+    let period = median(&mut intervals)?;
+    let mut phases: Vec<f64> = starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| *start as f64 - index as f64 * period)
+        .collect();
+    let phase = median(&mut phases)?;
+    let mut residuals: Vec<f64> = starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| (*start as f64 - (phase + index as f64 * period)).abs())
+        .collect();
+    let mad = median(&mut residuals).unwrap_or(period);
+    let inlier_limit = (mad * 3.0).max(4.0);
+    let inliers = starts
+        .iter()
+        .enumerate()
+        .filter(|(index, start)| {
+            (**start as f64 - (phase + *index as f64 * period)).abs() <= inlier_limit
+        })
+        .count();
+    let span_score = ((starts.len().saturating_sub(1)) as f32 / 12.0).clamp(0.0, 1.0);
+    let inlier_score = inliers as f32 / starts.len() as f32;
+    let residual_score = (1.0 - (mad / period.max(1.0) * 500.0) as f32).clamp(0.0, 1.0);
+    Some(PhasingClockFit {
+        period_samples: period,
+        phase_sample: phase,
+        confidence: (span_score * 0.35 + inlier_score * 0.45 + residual_score * 0.20)
+            .clamp(0.0, 1.0),
+    })
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
     }
-    (variance > f64::EPSILON).then_some(covariance / variance)
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    })
 }
 
 fn infer_lpm_from_period(period_samples: f64) -> Option<FaxLpm> {
@@ -2195,5 +2516,67 @@ mod tests {
         ] {
             assert!(FaxDecoder::new(WORK_SAMPLE_RATE, config).is_err());
         }
+    }
+
+    #[test]
+    fn robust_phasing_fit_rejects_real_radio_edge_jitter() {
+        let starts = VecDeque::from([
+            1_757_886, 1_763_872, 1_769_857, 1_775_894, 1_781_891, 1_787_891, 1_793_891, 1_799_891,
+        ]);
+        let old_ols = {
+            let first = *starts.front().unwrap() as f64;
+            let mean_x = (starts.len() - 1) as f64 * 0.5;
+            let mean_y = starts
+                .iter()
+                .map(|start| *start as f64 - first)
+                .sum::<f64>()
+                / starts.len() as f64;
+            let mut covariance = 0.0;
+            let mut variance = 0.0;
+            for (index, start) in starts.iter().enumerate() {
+                let x = index as f64 - mean_x;
+                covariance += x * (*start as f64 - first - mean_y);
+                variance += x * x;
+            }
+            covariance / variance
+        };
+        let fit = fitted_phasing_clock(&starts).unwrap();
+        assert!((old_ols - 6_002.726_190_476).abs() < 1.0e-6);
+        assert!((fit.period_samples - 6_000.0).abs() <= 0.25, "fit={fit:?}");
+    }
+
+    #[test]
+    fn paper_correction_applies_phase_across_row_boundaries() {
+        let input: Vec<u8> = (0..12).collect();
+        let point = FaxClockCalibrationPoint {
+            revision: 1,
+            reference_line: 0,
+            phase_pixels: 1.0,
+            clock_ppm: 0.0,
+            confidence: 1.0,
+            source: FaxClockSource::Manual,
+            status: FaxClockStatus::Locked,
+        };
+        let corrected =
+            correct_fax_paper(&input, 4, 3, 0, &[point], FaxPaperCorrection::default()).unwrap();
+        assert_eq!(corrected, vec![255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn paper_correction_extrapolates_clock_ppm() {
+        let input: Vec<u8> = (0..16).collect();
+        let point = FaxClockCalibrationPoint {
+            revision: 1,
+            reference_line: 0,
+            phase_pixels: 0.0,
+            clock_ppm: 250_000.0,
+            confidence: 1.0,
+            source: FaxClockSource::Phasing,
+            status: FaxClockStatus::Locked,
+        };
+        let corrected =
+            correct_fax_paper(&input, 4, 4, 0, &[point], FaxPaperCorrection::default()).unwrap();
+        assert_eq!(&corrected[4..8], &[3, 4, 5, 6]);
+        assert_eq!(&corrected[8..12], &[6, 7, 8, 9]);
     }
 }

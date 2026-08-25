@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-25
+
+- Recover radiofax line period and horizontal phase with robust phasing
+  statistics instead of freezing a short ordinary least-squares window.
+- Project framed page starts onto the recovered line grid and invalidate stale
+  clock evidence after rejected phasing cycles.
+- Add nominal-paper calibration events, dead-sector tracking, and a bounded
+  cross-row paper correction helper for continuous receivers.
+- Expose clock source, status, confidence, phase, ppm, and raster-basis
+  metadata while preserving immediate paper output.
+
 ## 0.2.0 - 2026-08-24
 
 - Add first-class `SstvPaperDecoder` and `FaxPaperDecoder` orchestration APIs.

@@ -1,6 +1,6 @@
 use crate::fax::{
-    FaxDecodeEvent, FaxDecodeEventRef, FaxDecoder, FaxDecoderConfig, FaxIoc, FaxLpm, FaxModulation,
-    FaxSpec,
+    FaxClockCalibrationPoint, FaxClockRecoveryMode, FaxDecodeEvent, FaxDecodeEventRef, FaxDecoder,
+    FaxDecoderConfig, FaxIoc, FaxLpm, FaxModulation, FaxRasterBasis, FaxSpec,
 };
 use crate::{Error, PaperBoundaryKind, Result};
 
@@ -32,6 +32,8 @@ impl Default for FaxPaperMode {
 pub struct FaxPaperConfig {
     /// Automatic fallback or manually locked parameters.
     pub mode: FaxPaperMode,
+    /// Automatic line-clock and horizontal-phase recovery.
+    pub clock_recovery: FaxClockRecoveryMode,
     /// AM candidate evaluated alongside the fallback FM detector in Auto.
     pub auto_am_modulation: FaxModulation,
     /// Full-scale amplitude used by AM decoding.
@@ -57,6 +59,7 @@ impl Default for FaxPaperConfig {
         let defaults = FaxDecoderConfig::default();
         Self {
             mode: FaxPaperMode::default(),
+            clock_recovery: FaxClockRecoveryMode::Auto,
             auto_am_modulation: FaxModulation::AmSubcarrier {
                 carrier_hz: 1900.0,
                 black_level: 0.0,
@@ -105,6 +108,15 @@ pub enum FaxPaperEventRef<'a> {
         /// Candidate IOC.
         ioc: FaxIoc,
     },
+    /// A clock model for correcting the current nominal paper segment.
+    ClockCalibration {
+        /// Decoder-local paper identifier.
+        paper_id: u64,
+        /// Segment boundary to which the calibration applies.
+        boundary_id: u64,
+        /// Calibration control point.
+        calibration: FaxClockCalibrationPoint,
+    },
     /// One continuous-paper grayscale row is ready.
     LineReady {
         /// Decoder-local paper identifier.
@@ -119,6 +131,8 @@ pub enum FaxPaperEventRef<'a> {
         spec: FaxSpec,
         /// Grayscale pixels, valid until the callback returns.
         pixels: &'a [u8],
+        /// Coordinate basis of the row.
+        basis: FaxRasterBasis,
     },
     /// A trusted APT-delimited fax capture completed.
     TransmissionCompleted {
@@ -180,6 +194,15 @@ pub enum FaxPaperEvent {
         /// Candidate IOC.
         ioc: FaxIoc,
     },
+    /// An owned clock calibration point.
+    ClockCalibration {
+        /// Paper identifier.
+        paper_id: u64,
+        /// Segment boundary identifier.
+        boundary_id: u64,
+        /// Calibration control point.
+        calibration: FaxClockCalibrationPoint,
+    },
     /// One owned fax paper row.
     LineReady {
         /// Decoder-local paper identifier.
@@ -194,6 +217,8 @@ pub enum FaxPaperEvent {
         spec: FaxSpec,
         /// Owned grayscale pixels.
         pixels: Vec<u8>,
+        /// Coordinate basis of the row.
+        basis: FaxRasterBasis,
     },
     /// A trusted fax transmission completed.
     TransmissionCompleted {
@@ -248,6 +273,15 @@ impl FaxPaperEventRef<'_> {
                 trusted: *trusted,
             },
             Self::AptDetected { ioc } => FaxPaperEvent::AptDetected { ioc: *ioc },
+            Self::ClockCalibration {
+                paper_id,
+                boundary_id,
+                calibration,
+            } => FaxPaperEvent::ClockCalibration {
+                paper_id: *paper_id,
+                boundary_id: *boundary_id,
+                calibration: *calibration,
+            },
             Self::LineReady {
                 paper_id,
                 boundary_id,
@@ -255,6 +289,7 @@ impl FaxPaperEventRef<'_> {
                 segment_line_index,
                 spec,
                 pixels,
+                basis,
             } => FaxPaperEvent::LineReady {
                 paper_id: *paper_id,
                 boundary_id: *boundary_id,
@@ -262,6 +297,7 @@ impl FaxPaperEventRef<'_> {
                 segment_line_index: *segment_line_index,
                 spec: *spec,
                 pixels: pixels.to_vec(),
+                basis: *basis,
             },
             Self::TransmissionCompleted {
                 paper_id,
@@ -316,6 +352,146 @@ struct Capture {
     spec: FaxSpec,
 }
 
+const DEAD_SECTOR_TRACKING_LINES: usize = 32;
+const DEAD_SECTOR_TRACKING_STRIDE: u64 = 8;
+
+#[derive(Debug, Default)]
+struct DeadSectorClockTracker {
+    rows: std::collections::VecDeque<(u64, Vec<u8>)>,
+    measurements: std::collections::VecDeque<(u64, f64)>,
+    revision: u32,
+    last_emitted: Option<FaxClockCalibrationPoint>,
+}
+
+impl DeadSectorClockTracker {
+    fn reset(&mut self, initial: Option<FaxClockCalibrationPoint>) {
+        self.rows.clear();
+        self.measurements.clear();
+        self.revision = initial.map_or(0, |point| point.revision);
+        self.last_emitted = initial;
+    }
+
+    fn observe(
+        &mut self,
+        line_index: u64,
+        spec: FaxSpec,
+        pixels: &[u8],
+    ) -> Option<FaxClockCalibrationPoint> {
+        if pixels.len() != spec.width() as usize {
+            return None;
+        }
+        self.rows.push_back((line_index, pixels.to_vec()));
+        while self.rows.len() > DEAD_SECTOR_TRACKING_LINES {
+            self.rows.pop_front();
+        }
+        if self.rows.len() < DEAD_SECTOR_TRACKING_LINES
+            || line_index % DEAD_SECTOR_TRACKING_STRIDE != 0
+        {
+            return None;
+        }
+        let width = spec.width() as usize;
+        let sector = width.saturating_sub(spec.active_width() as usize).max(1);
+        let mut sums = vec![0.0_f64; width];
+        let mut squares = vec![0.0_f64; width];
+        for (_, row) in &self.rows {
+            for (column, value) in row.iter().copied().enumerate() {
+                let value = f64::from(value);
+                sums[column] += value;
+                squares[column] += value * value;
+            }
+        }
+        let count = self.rows.len() as f64;
+        let mut scores = vec![0.0_f64; width - sector + 1];
+        let mut score = 0.0;
+        for column in 0..sector {
+            score += column_score(sums[column], squares[column], count);
+        }
+        scores[0] = score / sector as f64;
+        for start in 1..scores.len() {
+            score += column_score(sums[start + sector - 1], squares[start + sector - 1], count)
+                - column_score(sums[start - 1], squares[start - 1], count);
+            scores[start] = score / sector as f64;
+        }
+        let (best_start, best_score) = scores
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(&right.1))?;
+        let second_score = scores
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(start, _)| start.abs_diff(best_start) >= sector)
+            .map(|(_, score)| score)
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
+        let strength = (best_score / 127.5).clamp(0.0, 1.0);
+        let uniqueness = ((best_score - second_score) / best_score.abs().max(1.0)).clamp(0.0, 1.0);
+        let confidence = (strength * 0.55 + uniqueness * 0.45) as f32;
+        if confidence < 0.55 {
+            return None;
+        }
+        let desired = spec.active_width() as f64;
+        let mut phase = desired - best_start as f64;
+        let half = width as f64 * 0.5;
+        while phase > half {
+            phase -= width as f64;
+        }
+        while phase < -half {
+            phase += width as f64;
+        }
+        if let Some((_, previous)) = self.measurements.back().copied() {
+            while phase - previous > half {
+                phase -= width as f64;
+            }
+            while phase - previous < -half {
+                phase += width as f64;
+            }
+        }
+        self.measurements.push_back((line_index, phase));
+        while self.measurements.len() > 16 {
+            self.measurements.pop_front();
+        }
+        let mut slopes = Vec::new();
+        for (index, left) in self.measurements.iter().enumerate() {
+            for right in self.measurements.iter().skip(index + 1) {
+                let lines = right.0.saturating_sub(left.0);
+                if lines > 0 {
+                    slopes.push((right.1 - left.1) / lines as f64);
+                }
+            }
+        }
+        slopes.sort_by(f64::total_cmp);
+        let slope = slopes.get(slopes.len() / 2).copied().unwrap_or(0.0);
+        let clock_ppm = (slope / width as f64 * 1_000_000.0) as f32;
+        let point = FaxClockCalibrationPoint {
+            revision: self.revision.saturating_add(1),
+            reference_line: line_index,
+            phase_pixels: phase as f32,
+            clock_ppm,
+            confidence,
+            source: crate::fax::FaxClockSource::DeadSector,
+            status: crate::fax::FaxClockStatus::Tracking,
+        };
+        let changed = self.last_emitted.is_none_or(|previous| {
+            (previous.phase_pixels - point.phase_pixels).abs() >= 0.25
+                || (previous.clock_ppm - point.clock_ppm).abs() >= 5.0
+        });
+        if !changed {
+            return None;
+        }
+        self.revision = point.revision;
+        self.last_emitted = Some(point);
+        Some(point)
+    }
+}
+
+fn column_score(sum: f64, squares: f64, count: f64) -> f64 {
+    let mean = sum / count;
+    let variance = (squares / count - mean * mean).max(0.0);
+    (mean - 127.5).abs() - variance.sqrt() * 1.5
+}
+
 /// Continuous radiofax raster with parallel APT/phasing acquisition.
 #[derive(Debug)]
 pub struct FaxPaperDecoder {
@@ -333,6 +509,7 @@ pub struct FaxPaperDecoder {
     capture: Option<Capture>,
     started: bool,
     finished: bool,
+    dead_sector_clock: DeadSectorClockTracker,
 }
 
 impl FaxPaperDecoder {
@@ -359,6 +536,7 @@ impl FaxPaperDecoder {
             capture: None,
             started: false,
             finished: false,
+            dead_sector_clock: DeadSectorClockTracker::default(),
         })
     }
 
@@ -481,7 +659,11 @@ impl FaxPaperDecoder {
                 sink.on_event(FaxPaperEventRef::AptDetected { ioc });
                 Ok(1)
             }
-            FaxDecodeEvent::PageStarted { page_id, spec } => {
+            FaxDecodeEvent::PageStarted {
+                page_id,
+                spec,
+                mut clock,
+            } => {
                 if self.capture.is_some() {
                     return Ok(0);
                 }
@@ -516,12 +698,20 @@ impl FaxPaperDecoder {
                     kind: PaperBoundaryKind::AptPhasing,
                     trusted: true,
                 });
-                Ok(1)
+                clock.reference_line = self.paper_line;
+                self.dead_sector_clock.reset(Some(clock));
+                sink.on_event(FaxPaperEventRef::ClockCalibration {
+                    paper_id: self.paper_id,
+                    boundary_id,
+                    calibration: clock,
+                });
+                Ok(2)
             }
             FaxDecodeEvent::LineReady {
                 page_id,
                 line_index,
                 pixels,
+                basis,
             } => {
                 let Some(capture) = self.capture.as_ref().filter(|capture| {
                     capture.detector == detector_index && capture.page_id == page_id
@@ -538,8 +728,21 @@ impl FaxPaperDecoder {
                     segment_line_index: line_index,
                     spec: capture.spec,
                     pixels: &pixels,
+                    basis,
                 });
-                Ok(1)
+                let calibration = self
+                    .dead_sector_clock
+                    .observe(paper_line, capture.spec, &pixels);
+                if let Some(calibration) = calibration {
+                    sink.on_event(FaxPaperEventRef::ClockCalibration {
+                        paper_id: self.paper_id,
+                        boundary_id: capture.boundary_id,
+                        calibration,
+                    });
+                    Ok(2)
+                } else {
+                    Ok(1)
+                }
             }
             FaxDecodeEvent::PageCompleted {
                 page_id,
@@ -597,7 +800,7 @@ impl FaxPaperDecoder {
         sink: &mut impl FaxPaperSink,
     ) -> usize {
         match event {
-            FaxDecodeEvent::PageStarted { page_id, spec } => {
+            FaxDecodeEvent::PageStarted { page_id, spec, .. } => {
                 self.raster_page_id = Some(page_id);
                 self.raster_segment_start = self.paper_line;
                 self.current_spec = spec;
@@ -607,6 +810,7 @@ impl FaxPaperDecoder {
                 page_id,
                 line_index,
                 pixels,
+                basis,
             } if self.raster_page_id == Some(page_id) => {
                 let paper_line = self.raster_segment_start + u64::from(line_index);
                 self.paper_line = self.paper_line.max(paper_line + 1);
@@ -617,8 +821,21 @@ impl FaxPaperDecoder {
                     segment_line_index: line_index,
                     spec: self.current_spec,
                     pixels: &pixels,
+                    basis,
                 });
-                1
+                if let Some(calibration) =
+                    self.dead_sector_clock
+                        .observe(paper_line, self.current_spec, &pixels)
+                {
+                    sink.on_event(FaxPaperEventRef::ClockCalibration {
+                        paper_id: self.paper_id,
+                        boundary_id: self.active_boundary_id,
+                        calibration,
+                    });
+                    2
+                } else {
+                    1
+                }
             }
             _ => 0,
         }
@@ -642,6 +859,7 @@ impl FaxPaperDecoder {
         let boundary_id = self.next_boundary_id;
         self.next_boundary_id += 1;
         self.active_boundary_id = boundary_id;
+        self.dead_sector_clock.reset(None);
         sink.on_event(FaxPaperEventRef::Boundary {
             paper_id: self.paper_id,
             boundary_id,
@@ -662,6 +880,8 @@ fn immediate_decoder(
         input_sample_rate,
         FaxDecoderConfig {
             immediate_decode: true,
+            clock_recovery: FaxClockRecoveryMode::Off,
+            raster_basis: FaxRasterBasis::NominalPaper,
             ioc: Some(spec.ioc),
             lpm: Some(spec.lpm),
             modulation: spec.modulation,
@@ -709,6 +929,8 @@ fn acquisition_decoder(
         input_sample_rate,
         FaxDecoderConfig {
             immediate_decode: false,
+            clock_recovery: paper.clock_recovery,
+            raster_basis: FaxRasterBasis::NominalPaper,
             ioc: locked.map(|spec| spec.ioc),
             lpm: locked.map(|spec| spec.lpm),
             modulation,

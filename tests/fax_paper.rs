@@ -1,4 +1,6 @@
-use rasterwave::fax::{FaxEncodeOptions, FaxEncoder, FaxIoc, FaxLpm, FaxModulation, FaxSpec};
+use rasterwave::fax::{
+    FaxClockSource, FaxEncodeOptions, FaxEncoder, FaxIoc, FaxLpm, FaxModulation, FaxSpec,
+};
 use rasterwave::{
     FaxPaperConfig, FaxPaperDecoder, FaxPaperEvent, FaxPaperEventRef, FaxPaperMode, GrayImage,
     PaperBoundaryKind,
@@ -226,4 +228,52 @@ fn manual_lock_reports_mismatched_fax_header() {
             .iter()
             .any(|event| matches!(event, FaxPaperEvent::TransmissionCompleted { .. }))
     );
+}
+
+#[test]
+fn image_dead_sector_recovers_midstream_horizontal_phase() {
+    let spec = FaxSpec::standard(FaxIoc::Ioc288, FaxLpm::LPM_240);
+    let image = GrayImage::new(
+        spec.active_width(),
+        96,
+        vec![128; spec.active_width() as usize * 96],
+    )
+    .unwrap();
+    let mut encoder = FaxEncoder::new(
+        image,
+        spec,
+        12_000,
+        FaxEncodeOptions {
+            include_apt: false,
+            include_phasing: false,
+            ..FaxEncodeOptions::default()
+        },
+    )
+    .unwrap();
+    let mut samples = vec![0.0_f32; 900];
+    let mut chunk = [0.0_f32; 1_200];
+    while !encoder.is_finished() {
+        let count = encoder.read_samples(&mut chunk);
+        samples.extend_from_slice(&chunk[..count]);
+    }
+    let mut decoder = FaxPaperDecoder::new(
+        12_000,
+        FaxPaperConfig {
+            mode: FaxPaperMode::Manual { spec },
+            ..FaxPaperConfig::default()
+        },
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    feed(&mut decoder, &samples, &mut events);
+    let calibration = events.iter().find_map(|event| match event {
+        FaxPaperEvent::ClockCalibration { calibration, .. }
+            if calibration.source == FaxClockSource::DeadSector =>
+        {
+            Some(calibration)
+        }
+        _ => None,
+    });
+    assert!(calibration.is_some(), "events: {events:?}");
+    assert!(calibration.unwrap().phase_pixels.abs() > 20.0);
 }

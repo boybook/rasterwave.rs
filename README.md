@@ -201,6 +201,12 @@ APT/phasing boundary opens a capture range; completion closes only that range
 while fallback paper output continues. Signal loss and discontinuity emit a
 divider but never masquerade as successful protocol completion.
 
+Fax paper rows use the `NominalPaper` basis so an indefinitely growing receiver
+never silently changes its coordinate clock. `ClockCalibration` events provide
+phase, ppm, confidence and source control points. Apply them with
+`fax::correct_fax_paper` when rendering or saving a paper range; positive phase
+moves content to the right. Framed fax rows remain directly calibrated.
+
 ## Radiofax
 
 ```rust

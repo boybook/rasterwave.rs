@@ -96,6 +96,26 @@ instead of allowing silence or wideband noise to synthesize more rows. A caller
 with receiver-specific squelch evidence may set the coherence threshold to zero
 and end the page explicitly at its integration boundary.
 
+## Radiofax Clock Recovery
+
+Radiofax timing has two independent errors: line-period error produces a
+progressive slant, while line-phase error produces a constant circular shift.
+The decoder models both with `line_start(n) = phase + n * period`.
+
+Phasing edges are retained in a bounded 64-point history. Median interval and
+phase statistics reject threshold jitter before a confidence-gated clock is
+accepted. The page start is projected onto that fitted grid, so the expected
+phasing duration cannot introduce a separate horizontal offset. Rejected
+phasing cycles invalidate pending untrusted measurements instead of allowing a
+stale period to start a page.
+
+Continuous fax paper keeps a stable nominal-LPM coordinate basis. Clock
+calibration points describe the horizontal correction at a reference line and
+its ppm slope; later image dead-sector evidence may add tracking points.
+`correct_fax_paper` treats rows as one flattened raster while applying that
+model, so a shear may sample across row boundaries without a visible seam.
+Framed output continues to cut lines directly with the recovered clock.
+
 ## Threading And Future Node.js Binding
 
 The core exposes synchronous methods taking `&mut self`. This is the correct
