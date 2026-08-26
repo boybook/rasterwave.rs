@@ -88,8 +88,8 @@ fn apt_and_phasing_lead_to_streaming_lines() {
         _ => None,
     });
     let decoded_gradient = decoded_gradient.expect("second image line");
-    let active_width = ioc.active_width() as usize;
-    let mean_absolute_error = decoded_gradient[..active_width]
+    let image_width = ioc.width() as usize;
+    let mean_absolute_error = decoded_gradient[..image_width]
         .iter()
         .enumerate()
         .map(|(x, actual)| {
@@ -97,7 +97,7 @@ fn apt_and_phasing_lead_to_streaming_lines() {
             actual.abs_diff(expected) as f64
         })
         .sum::<f64>()
-        / active_width as f64;
+        / image_width as f64;
     assert!(
         mean_absolute_error < 18.0,
         "clean FM gradient MAE was {mean_absolute_error}"
@@ -426,7 +426,7 @@ fn symmetric_phasing_is_accepted_with_preconfigured_ioc() {
         FaxDecodeEvent::LineReady { pixels, .. } => Some(pixels),
         _ => None,
     });
-    let marker = brightest_window_start(&line.unwrap()[..ioc.active_width() as usize], 40);
+    let marker = brightest_window_start(&line.unwrap()[..ioc.width() as usize], 40);
     assert!(
         marker.abs_diff(200) <= 4,
         "symmetric phasing shifted the marker to x={marker}"
@@ -465,10 +465,9 @@ fn fractional_custom_lpm_uses_measured_cumulative_timing() {
     let markers: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            FaxDecodeEvent::LineReady { pixels, .. } => Some(brightest_window_start(
-                &pixels[..ioc.active_width() as usize],
-                40,
-            )),
+            FaxDecodeEvent::LineReady { pixels, .. } => {
+                Some(brightest_window_start(&pixels[..ioc.width() as usize], 40))
+            }
             _ => None,
         })
         .collect();

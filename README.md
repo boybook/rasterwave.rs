@@ -32,7 +32,7 @@ spawn threads, or depend on an async runtime.
 - Provisional and revised rows for formats such as Robot 36, where chroma spans
   adjacent radio lines.
 - WMO-style radiofax framing with IOC 288/576, configurable LPM, APT
-  selection, phasing, dead sector, confirmed stop pattern, and black tail.
+  selection, phasing, confirmed stop pattern, and black tail.
 - Parameterized FM and AM radiofax subcarriers. Clean PCM encode/decode loops
   cover both; over-air and third-party interoperability are separate checks.
 - `f32` and `i16` streaming decode inputs plus one-shot convenience functions.
@@ -43,7 +43,7 @@ spawn threads, or depend on an async runtime.
 
 ## Status
 
-Rasterwave is an early `0.2` API intended for integration and interoperability
+Rasterwave is an early `0.5` API intended for integration and interoperability
 work. The encoder and decoder share one immutable mode catalog.
 
 The primary built-in profiles currently include:
@@ -81,7 +81,7 @@ Or declare the dependency directly:
 
 ```toml
 [dependencies]
-rasterwave = "0.4"
+rasterwave = "0.5"
 ```
 
 The minimum supported Rust version is 1.85.
@@ -240,11 +240,14 @@ APT/phasing boundary opens a capture range; completion closes only that range
 while fallback paper output continues. Signal loss and discontinuity emit a
 divider but never masquerade as successful protocol completion.
 
-Fax paper rows use the `NominalPaper` basis so an indefinitely growing receiver
-never silently changes its coordinate clock. `ClockCalibration` events provide
-phase, ppm, confidence and source control points. Apply them with
-`fax::correct_fax_paper` when rendering or saving a paper range; positive phase
-moves content to the right. Framed fax rows remain directly calibrated.
+Fallback fax paper rows use the `NominalPaper` basis so an indefinitely growing
+receiver never silently changes its coordinate clock. Once trusted phasing is
+available, the capture segment is cut directly with the recovered line period
+and its rows use the `Calibrated` basis. Image-only reception may publish sparse
+`ImageContent` calibration points only after a stable margin persists across
+multiple windows; otherwise it stays nominal. Apply nominal-paper points with
+`fax::correct_fax_paper` when rendering or saving a paper range. Never apply
+them again to `Calibrated` rows.
 
 ## Radiofax
 
@@ -255,18 +258,18 @@ use rasterwave::fax::{FaxEncoder, FaxEncodeOptions, FaxIoc, FaxLpm, FaxSpec};
 fn fax_encoder() -> rasterwave::Result<FaxEncoder> {
     let spec = FaxSpec::standard(FaxIoc::Ioc576, FaxLpm::LPM_120);
     let page = GrayImage::new(
-        spec.active_width(),
+        spec.width(),
         800,
-        vec![255; spec.active_width() as usize * 800],
+        vec![255; spec.width() as usize * 800],
     )?;
     FaxEncoder::new(page, spec, 48_000, FaxEncodeOptions::default())
 }
 ```
 
-IOC is a geometric invariant, not a pixel width. Rasterwave's default square
-sampling policy uses full widths of 905/1810 and active picture widths of
-864/1728 for IOC 288/576. The encoder accepts active-width or full-width input,
-synthesizes the reserved dead sector, and the decoder emits full-width rows.
+IOC is a geometric invariant, not a pixel width. Rasterwave's square-sampling
+policy uses full image-line widths of 905/1810 for IOC 288/576. The 5% white
+interval is part of the phasing pattern, not a reserved interval inserted into
+every image line. The encoder therefore accepts and emits the full IOC width.
 Radiofax height remains open until APT stop, EOF, signal loss, or a
 caller-supplied bound.
 
@@ -274,7 +277,9 @@ WMO-listed rates are 60, 90, 120, and 240 LPM; those are also the decoder's
 automatic inference set. 180 LPM is available as an explicit interoperability
 extension and must be configured on receive. Default acquisition detects IOC
 from APT and timing from phasing. Phasing-only input is supported when IOC is
-preconfigured; image-only input cannot establish timing automatically. A
+preconfigured. Image-only continuous paper starts immediately at nominal timing
+and only adopts a conservative content-derived model when the evidence remains
+stable; this heuristic is not a protocol lock. A
 confirmed 450 Hz stop closes a page, while configured target-carrier
 level/coherence loss closes it as partial without generating rows from silence
 or broadband noise. An upstream squelch can disable the coherence threshold and

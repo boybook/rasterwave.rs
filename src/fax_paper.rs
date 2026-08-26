@@ -352,22 +352,31 @@ struct Capture {
     spec: FaxSpec,
 }
 
-const DEAD_SECTOR_TRACKING_LINES: usize = 64;
-const DEAD_SECTOR_TRACKING_STRIDE: u64 = 32;
-const DEAD_SECTOR_MAX_PPM: i32 = 5_000;
-const DEAD_SECTOR_COARSE_PPM_STEP: i32 = 100;
-const DEAD_SECTOR_FINE_PPM_STEP: i32 = 10;
-const DEAD_SECTOR_ULTRA_FINE_PPM_STEP: i32 = 1;
+const IMAGE_TIMING_TRACKING_LINES: usize = 64;
+const IMAGE_TIMING_TRACKING_STRIDE: u64 = 32;
+const IMAGE_TIMING_MARGIN_FRACTION: f64 = 0.045;
+const IMAGE_TIMING_MODEL_MEASUREMENTS: usize = 21;
+const IMAGE_TIMING_MODEL_MIN_MEASUREMENTS: usize = 5;
+const IMAGE_TIMING_MODEL_MIN_SPAN: u64 = 96;
+const IMAGE_TIMING_MODEL_PUBLISH_STRIDE: u64 = 128;
+const IMAGE_TIMING_MODEL_REFRESH_STRIDE: u64 = 512;
 
 #[derive(Clone, Copy, Debug)]
-struct DeadSectorCandidate {
-    sector_start: usize,
-    clock_ppm: f64,
+struct ImageTimingCandidate {
+    margin_start: usize,
     score: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DeadSectorMeasurement {
+struct ImageTimingObservation {
+    reference_line: u64,
+    phase_pixels: f64,
+    clock_ppm: f64,
+    confidence: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ImageTimingModel {
     reference_line: u64,
     phase_pixels: f64,
     clock_ppm: f64,
@@ -375,19 +384,21 @@ struct DeadSectorMeasurement {
 }
 
 #[derive(Debug, Default)]
-struct DeadSectorClockTracker {
+struct ImageTimingTracker {
     rows: std::collections::VecDeque<(u64, Vec<u8>)>,
-    measurements: std::collections::VecDeque<DeadSectorMeasurement>,
+    measurements: std::collections::VecDeque<ImageTimingObservation>,
     revision: u32,
+    model: Option<ImageTimingModel>,
     last_emitted: Option<FaxClockCalibrationPoint>,
 }
 
-impl DeadSectorClockTracker {
-    fn reset(&mut self, initial: Option<FaxClockCalibrationPoint>) {
+impl ImageTimingTracker {
+    fn reset(&mut self) {
         self.rows.clear();
         self.measurements.clear();
-        self.revision = initial.map_or(0, |point| point.revision);
-        self.last_emitted = initial;
+        self.revision = 0;
+        self.model = None;
+        self.last_emitted = None;
     }
 
     fn observe(
@@ -400,16 +411,16 @@ impl DeadSectorClockTracker {
             return None;
         }
         self.rows.push_back((line_index, pixels.to_vec()));
-        while self.rows.len() > DEAD_SECTOR_TRACKING_LINES {
+        while self.rows.len() > IMAGE_TIMING_TRACKING_LINES {
             self.rows.pop_front();
         }
-        if self.rows.len() < DEAD_SECTOR_TRACKING_LINES
-            || line_index % DEAD_SECTOR_TRACKING_STRIDE != 0
+        if self.rows.len() < IMAGE_TIMING_TRACKING_LINES
+            || line_index % IMAGE_TIMING_TRACKING_STRIDE != 0
         {
             return None;
         }
         let width = spec.width() as usize;
-        let sector = width.saturating_sub(spec.active_width() as usize).max(1);
+        let margin = ((width as f64 * IMAGE_TIMING_MARGIN_FRACTION).round() as usize).max(1);
         let mut minimum = u8::MAX;
         let mut maximum = u8::MIN;
         for (_, row) in &self.rows {
@@ -421,79 +432,23 @@ impl DeadSectorClockTracker {
         if maximum.saturating_sub(minimum) < 40 {
             return None;
         }
-        let prior_sector_start = self.last_emitted.map(|previous| {
+        let prior_margin_start = self.last_emitted.map(|previous| {
             let predicted_phase = f64::from(previous.phase_pixels)
                 + line_index.saturating_sub(previous.reference_line) as f64
                     * f64::from(previous.clock_ppm)
                     * width as f64
                     / 1_000_000.0;
             wrap_column(
-                (f64::from(spec.active_width()) - predicted_phase).round() as i64,
+                (width as f64 - margin as f64 - predicted_phase).round() as i64,
                 width,
             )
         });
-        let mut candidates = Vec::new();
-        let has_tracking_lock = self
-            .last_emitted
-            .is_some_and(|point| point.source == crate::fax::FaxClockSource::DeadSector);
-        let (coarse_start, coarse_end, coarse_step) = if has_tracking_lock {
-            let previous = self.last_emitted.expect("tracking lock exists");
-            let center = previous.clock_ppm.round() as i32;
-            (
-                (center - 250).max(-DEAD_SECTOR_MAX_PPM),
-                (center + 250).min(DEAD_SECTOR_MAX_PPM),
-                25,
-            )
-        } else {
-            (
-                -DEAD_SECTOR_MAX_PPM,
-                DEAD_SECTOR_MAX_PPM,
-                DEAD_SECTOR_COARSE_PPM_STEP,
-            )
-        };
-        for ppm in (coarse_start..=coarse_end).step_by(coarse_step as usize) {
-            candidates.extend(self.evaluate_clock(spec, f64::from(ppm), false, prior_sector_start));
-        }
-        let coarse = candidates
-            .iter()
-            .copied()
-            .max_by(|left, right| left.score.total_cmp(&right.score))?;
-        candidates.clear();
-        let fine_radius = if has_tracking_lock {
-            25
-        } else {
-            DEAD_SECTOR_COARSE_PPM_STEP
-        };
-        let fine_step = if has_tracking_lock {
-            5
-        } else {
-            DEAD_SECTOR_FINE_PPM_STEP
-        };
-        let fine_start = (coarse.clock_ppm as i32 - fine_radius).max(-DEAD_SECTOR_MAX_PPM);
-        let fine_end = (coarse.clock_ppm as i32 + fine_radius).min(DEAD_SECTOR_MAX_PPM);
-        for ppm in (fine_start..=fine_end).step_by(fine_step as usize) {
-            candidates.extend(self.evaluate_clock(spec, f64::from(ppm), false, prior_sector_start));
-        }
-        let fine = candidates
-            .iter()
-            .copied()
-            .max_by(|left, right| left.score.total_cmp(&right.score))?;
-        candidates.clear();
-        let ultra_radius = if has_tracking_lock {
-            5
-        } else {
-            DEAD_SECTOR_FINE_PPM_STEP
-        };
-        let ultra_start = (fine.clock_ppm as i32 - ultra_radius).max(-DEAD_SECTOR_MAX_PPM);
-        let ultra_end = (fine.clock_ppm as i32 + ultra_radius).min(DEAD_SECTOR_MAX_PPM);
-        for ppm in (ultra_start..=ultra_end).step_by(DEAD_SECTOR_ULTRA_FINE_PPM_STEP as usize) {
-            candidates.extend(self.evaluate_clock(spec, f64::from(ppm), true, prior_sector_start));
-        }
+        let correction_ppm = self.model.map_or(0.0, |model| model.clock_ppm);
+        let mut candidates = self.evaluate_clock(spec, correction_ppm, prior_margin_start);
         candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
         let best = *candidates.first()?;
         let second = candidates.iter().copied().find(|candidate| {
-            circular_distance(candidate.sector_start, best.sector_start, width) >= sector / 2
-                || (candidate.clock_ppm - best.clock_ppm).abs() >= 250.0
+            circular_distance(candidate.margin_start, best.margin_start, width) >= margin / 2
         });
         let strength = best.score.clamp(0.0, 1.0);
         let second_score = second.map_or(0.0, |candidate| candidate.score);
@@ -502,8 +457,8 @@ impl DeadSectorClockTracker {
         if confidence < 0.47 {
             return None;
         }
-        let desired = spec.active_width() as f64;
-        let mut phase = desired - best.sector_start as f64;
+        let desired = width as f64 - margin as f64;
+        let mut phase = desired - best.margin_start as f64;
         let half = width as f64 * 0.5;
         while phase > half {
             phase -= width as f64;
@@ -538,85 +493,69 @@ impl DeadSectorClockTracker {
                 phase += width as f64;
             }
         }
-        self.measurements.push_back(DeadSectorMeasurement {
+        self.measurements.push_back(ImageTimingObservation {
             reference_line: line_index,
             phase_pixels: phase,
-            clock_ppm: best.clock_ppm,
+            clock_ppm: correction_ppm,
             confidence,
         });
-        while self.measurements.len() > 5 {
+        while self.measurements.len() > IMAGE_TIMING_MODEL_MEASUREMENTS {
             self.measurements.pop_front();
         }
-        if self.measurements.len() < 3 {
+        if self.measurements.len() < IMAGE_TIMING_MODEL_MIN_MEASUREMENTS {
             return None;
         }
-        let mut ppm_values: Vec<_> = self
-            .measurements
-            .iter()
-            .map(|measurement| measurement.clock_ppm)
-            .collect();
-        let clock_ppm = median_value(&mut ppm_values)?;
-        let mut projected_phases: Vec<_> = self
-            .measurements
-            .iter()
-            .map(|measurement| {
-                measurement.phase_pixels
-                    + line_index.saturating_sub(measurement.reference_line) as f64
-                        * measurement.clock_ppm
-                        * width as f64
-                        / 1_000_000.0
-            })
-            .collect();
-        let phase_anchor = *projected_phases.last()?;
-        for projected in &mut projected_phases {
-            while *projected - phase_anchor > half {
-                *projected -= width as f64;
+        let fit = robust_image_timing_model(&self.measurements, line_index, width as f64)?;
+        if fit.confidence < 0.62 {
+            return None;
+        }
+        let model = if let Some(previous) = self.model {
+            let elapsed = line_index.saturating_sub(previous.reference_line) as f64;
+            let predicted_phase =
+                previous.phase_pixels + elapsed * previous.clock_ppm * width as f64 / 1_000_000.0;
+            let innovation = fit.phase_pixels - predicted_phase;
+            let phase_gate = (margin as f64 * 0.04).max(2.0);
+            if innovation.abs() > phase_gate {
+                return None;
             }
-            while *projected - phase_anchor < -half {
-                *projected += width as f64;
+            let clock_delta = (fit.clock_ppm - previous.clock_ppm).clamp(-20.0, 20.0);
+            ImageTimingModel {
+                reference_line: line_index,
+                phase_pixels: predicted_phase,
+                clock_ppm: previous.clock_ppm + clock_delta * 0.10,
+                confidence: previous.confidence * 0.65 + fit.confidence * 0.35,
             }
-        }
-        phase = median_value(&mut projected_phases)?;
-        let mut ppm_deviations: Vec<_> = self
-            .measurements
-            .iter()
-            .map(|measurement| (measurement.clock_ppm - clock_ppm).abs())
-            .collect();
-        let mut phase_deviations: Vec<_> = projected_phases
-            .iter()
-            .map(|projected| (*projected - phase).abs())
-            .collect();
-        let ppm_mad = median_value(&mut ppm_deviations).unwrap_or(f64::INFINITY);
-        let phase_mad = median_value(&mut phase_deviations).unwrap_or(f64::INFINITY);
-        if ppm_mad > 60.0 || phase_mad > (sector as f64 * 0.15).max(4.0) {
-            return None;
-        }
-        let mean_confidence = self
-            .measurements
-            .iter()
-            .map(|measurement| measurement.confidence)
-            .sum::<f64>()
-            / self.measurements.len() as f64;
-        let consistency = (1.0 - ppm_mad / 60.0).clamp(0.0, 1.0) * 0.5
-            + (1.0 - phase_mad / (sector as f64 * 0.15).max(4.0)).clamp(0.0, 1.0) * 0.5;
-        let confidence = (mean_confidence * 0.75 + consistency * 0.25) as f32;
-        if confidence < 0.58 {
-            return None;
-        }
+        } else {
+            ImageTimingModel {
+                phase_pixels: fit.phase_pixels.round(),
+                clock_ppm: fit.clock_ppm,
+                ..fit
+            }
+        };
+        self.model = Some(model);
+
         let point = FaxClockCalibrationPoint {
             revision: self.revision.saturating_add(1),
-            reference_line: line_index,
-            phase_pixels: phase as f32,
-            clock_ppm: clock_ppm as f32,
-            confidence,
-            source: crate::fax::FaxClockSource::DeadSector,
+            reference_line: model.reference_line,
+            phase_pixels: model.phase_pixels as f32,
+            clock_ppm: model.clock_ppm as f32,
+            confidence: model.confidence as f32,
+            source: crate::fax::FaxClockSource::ImageContent,
             status: crate::fax::FaxClockStatus::Tracking,
         };
-        let changed = self.last_emitted.is_none_or(|previous| {
-            (previous.phase_pixels - point.phase_pixels).abs() >= 0.25
-                || (previous.clock_ppm - point.clock_ppm).abs() >= 5.0
+        let should_publish = self.last_emitted.is_none_or(|previous| {
+            if previous.source != crate::fax::FaxClockSource::ImageContent {
+                return true;
+            }
+            let elapsed = model.reference_line.saturating_sub(previous.reference_line);
+            let previous_phase = f64::from(previous.phase_pixels)
+                + elapsed as f64 * f64::from(previous.clock_ppm) * width as f64 / 1_000_000.0;
+            elapsed >= IMAGE_TIMING_MODEL_REFRESH_STRIDE
+                || elapsed >= IMAGE_TIMING_MODEL_PUBLISH_STRIDE
+                    && ((model.phase_pixels - previous_phase).abs() >= 0.75
+                        || (model.clock_ppm - f64::from(previous.clock_ppm)).abs() >= 2.0)
         });
-        if !changed {
+        if !should_publish {
             return None;
         }
         self.revision = point.revision;
@@ -628,11 +567,10 @@ impl DeadSectorClockTracker {
         &self,
         spec: FaxSpec,
         correction_ppm: f64,
-        interpolate: bool,
-        prior_sector_start: Option<usize>,
-    ) -> [DeadSectorCandidate; 2] {
+        prior_margin_start: Option<usize>,
+    ) -> Vec<ImageTimingCandidate> {
         let width = spec.width() as usize;
-        let sector = width.saturating_sub(spec.active_width() as usize).max(1);
+        let margin = ((width as f64 * IMAGE_TIMING_MARGIN_FRACTION).round() as usize).max(1);
         let reference_line = self.rows.back().map_or(0, |(line, _)| *line);
         let mut sums = vec![0.0_f64; width];
         let mut squares = vec![0.0_f64; width];
@@ -644,12 +582,9 @@ impl DeadSectorClockTracker {
                 let left_unwrapped = source.floor();
                 let fraction = source - left_unwrapped;
                 let left = wrap_column(left_unwrapped as i64, width);
-                let value = if interpolate {
-                    let right = (left + 1) % width;
-                    f64::from(row[left]) + (f64::from(row[right]) - f64::from(row[left])) * fraction
-                } else {
-                    f64::from(row[wrap_column(source.round() as i64, width)])
-                };
+                let right = (left + 1) % width;
+                let value = f64::from(row[left])
+                    + (f64::from(row[right]) - f64::from(row[left])) * fraction;
                 sums[column] += value;
                 squares[column] += value * value;
             }
@@ -665,23 +600,23 @@ impl DeadSectorClockTracker {
         let mean_square_prefix =
             circular_prefix(&means.iter().map(|value| value * value).collect::<Vec<_>>());
         let score_prefix = circular_prefix(&column_scores);
-        let edge = (sector / 4).max(4);
+        let edge = (margin / 4).max(4);
         let mut scored = Vec::with_capacity(width);
         for start in 0..width {
-            let band_score = window_sum(&score_prefix, start, sector) / sector as f64;
-            let band_mean = window_sum(&mean_prefix, start, sector) / sector as f64;
-            let band_square = window_sum(&mean_square_prefix, start, sector) / sector as f64;
+            let band_score = window_sum(&score_prefix, start, margin) / margin as f64;
+            let band_mean = window_sum(&mean_prefix, start, margin) / margin as f64;
+            let band_square = window_sum(&mean_square_prefix, start, margin) / margin as f64;
             let spatial_variance = (band_square - band_mean * band_mean).max(0.0);
             let uniformity = (1.0 - spatial_variance.sqrt() / 96.0).clamp(0.0, 1.0);
             let before = window_sum(&mean_prefix, start + width - edge, edge) / edge as f64;
-            let after = window_sum(&mean_prefix, start + sector, edge) / edge as f64;
+            let after = window_sum(&mean_prefix, start + margin, edge) / edge as f64;
             let edge_contrast =
                 (((band_mean - before).abs() + (band_mean - after).abs()) / 510.0).clamp(0.0, 1.0);
             let evidence =
                 (band_score * 0.62 + uniformity * 0.13 + edge_contrast * 0.25).clamp(0.0, 1.0);
-            let score = if let Some(prior) = prior_sector_start {
+            let score = if let Some(prior) = prior_margin_start {
                 let alignment = (1.0
-                    - circular_distance(start, prior, width) as f64 / (sector * 3) as f64)
+                    - circular_distance(start, prior, width) as f64 / (margin * 3) as f64)
                     .clamp(0.0, 1.0);
                 evidence * 0.82 + alignment * 0.18
             } else {
@@ -694,21 +629,101 @@ impl DeadSectorClockTracker {
         let second = scored
             .iter()
             .copied()
-            .find(|candidate| circular_distance(candidate.0, best.0, width) >= sector / 2)
+            .find(|candidate| circular_distance(candidate.0, best.0, width) >= margin / 2)
             .unwrap_or(best);
-        [
-            DeadSectorCandidate {
-                sector_start: best.0,
-                clock_ppm: correction_ppm,
+        vec![
+            ImageTimingCandidate {
+                margin_start: best.0,
                 score: best.1,
             },
-            DeadSectorCandidate {
-                sector_start: second.0,
-                clock_ppm: correction_ppm,
+            ImageTimingCandidate {
+                margin_start: second.0,
                 score: second.1,
             },
         ]
     }
+}
+
+fn robust_image_timing_model(
+    measurements: &std::collections::VecDeque<ImageTimingObservation>,
+    reference_line: u64,
+    width: f64,
+) -> Option<ImageTimingModel> {
+    let first_line = measurements.front()?.reference_line;
+    let last_line = measurements.back()?.reference_line;
+    if last_line.saturating_sub(first_line) < IMAGE_TIMING_MODEL_MIN_SPAN {
+        return None;
+    }
+    let mut slopes = Vec::new();
+    for (index, left) in measurements.iter().enumerate() {
+        for right in measurements.iter().skip(index + 1) {
+            let span = right.reference_line.saturating_sub(left.reference_line);
+            if span >= IMAGE_TIMING_TRACKING_STRIDE {
+                slopes.push((right.phase_pixels - left.phase_pixels) / span as f64);
+            }
+        }
+    }
+    let initial_slope = median_value(&mut slopes)?;
+    let origin = first_line as f64;
+    let mut intercepts: Vec<_> = measurements
+        .iter()
+        .map(|measurement| {
+            measurement.phase_pixels - initial_slope * (measurement.reference_line as f64 - origin)
+        })
+        .collect();
+    let initial_intercept = median_value(&mut intercepts)?;
+    let mut residuals: Vec<_> = measurements
+        .iter()
+        .map(|measurement| {
+            (measurement.phase_pixels
+                - (initial_intercept
+                    + initial_slope * (measurement.reference_line as f64 - origin)))
+                .abs()
+        })
+        .collect();
+    let mad = median_value(&mut residuals).unwrap_or(f64::INFINITY);
+    let inlier_limit = (mad * 3.5).max(1.5);
+    let mut sum_weight = 0.0;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_xx = 0.0;
+    let mut sum_xy = 0.0;
+    let mut confidence_sum = 0.0;
+    let mut inliers = 0_usize;
+    for measurement in measurements {
+        let x = measurement.reference_line as f64 - origin;
+        let predicted = initial_intercept + initial_slope * x;
+        if (measurement.phase_pixels - predicted).abs() > inlier_limit {
+            continue;
+        }
+        let weight = measurement.confidence.clamp(0.1, 1.0);
+        sum_weight += weight;
+        sum_x += weight * x;
+        sum_y += weight * measurement.phase_pixels;
+        sum_xx += weight * x * x;
+        sum_xy += weight * x * measurement.phase_pixels;
+        confidence_sum += measurement.confidence;
+        inliers += 1;
+    }
+    if inliers < IMAGE_TIMING_MODEL_MIN_MEASUREMENTS {
+        return None;
+    }
+    let denominator = sum_weight * sum_xx - sum_x * sum_x;
+    if denominator.abs() <= f64::EPSILON {
+        return None;
+    }
+    let slope = (sum_weight * sum_xy - sum_x * sum_y) / denominator;
+    let intercept = (sum_y - slope * sum_x) / sum_weight;
+    let phase_pixels = intercept + slope * (reference_line as f64 - origin);
+    let inlier_score = inliers as f64 / measurements.len() as f64;
+    let residual_score = (1.0 - mad / 4.0).clamp(0.0, 1.0);
+    let measurement_score = confidence_sum / inliers as f64;
+    Some(ImageTimingModel {
+        reference_line,
+        phase_pixels,
+        clock_ppm: slope / width * 1_000_000.0,
+        confidence: measurement_score * 0.55 + inlier_score * 0.30 + residual_score * 0.15,
+    })
 }
 
 fn column_score(sum: f64, squares: f64, count: f64) -> f64 {
@@ -771,7 +786,7 @@ pub struct FaxPaperDecoder {
     capture: Option<Capture>,
     started: bool,
     finished: bool,
-    dead_sector_clock: DeadSectorClockTracker,
+    image_timing: ImageTimingTracker,
 }
 
 impl FaxPaperDecoder {
@@ -798,7 +813,7 @@ impl FaxPaperDecoder {
             capture: None,
             started: false,
             finished: false,
-            dead_sector_clock: DeadSectorClockTracker::default(),
+            image_timing: ImageTimingTracker::default(),
         })
     }
 
@@ -924,7 +939,7 @@ impl FaxPaperDecoder {
             FaxDecodeEvent::PageStarted {
                 page_id,
                 spec,
-                mut clock,
+                clock,
             } => {
                 if self.capture.is_some() {
                     return Ok(0);
@@ -960,12 +975,20 @@ impl FaxPaperDecoder {
                     kind: PaperBoundaryKind::AptPhasing,
                     trusted: true,
                 });
-                clock.reference_line = self.paper_line;
-                self.dead_sector_clock.reset(Some(clock));
+                self.image_timing.reset();
+                let calibration = FaxClockCalibrationPoint {
+                    revision: clock.revision,
+                    reference_line: self.paper_line,
+                    phase_pixels: 0.0,
+                    clock_ppm: 0.0,
+                    confidence: clock.confidence,
+                    source: clock.source,
+                    status: clock.status,
+                };
                 sink.on_event(FaxPaperEventRef::ClockCalibration {
                     paper_id: self.paper_id,
                     boundary_id,
-                    calibration: clock,
+                    calibration,
                 });
                 Ok(2)
             }
@@ -992,9 +1015,9 @@ impl FaxPaperDecoder {
                     pixels: &pixels,
                     basis,
                 });
-                let calibration = self
-                    .dead_sector_clock
-                    .observe(paper_line, capture.spec, &pixels);
+                let calibration = (basis == FaxRasterBasis::NominalPaper)
+                    .then(|| self.image_timing.observe(paper_line, capture.spec, &pixels))
+                    .flatten();
                 if let Some(calibration) = calibration {
                     sink.on_event(FaxPaperEventRef::ClockCalibration {
                         paper_id: self.paper_id,
@@ -1086,7 +1109,7 @@ impl FaxPaperDecoder {
                     basis,
                 });
                 if let Some(calibration) =
-                    self.dead_sector_clock
+                    self.image_timing
                         .observe(paper_line, self.current_spec, &pixels)
                 {
                     sink.on_event(FaxPaperEventRef::ClockCalibration {
@@ -1121,7 +1144,7 @@ impl FaxPaperDecoder {
         let boundary_id = self.next_boundary_id;
         self.next_boundary_id += 1;
         self.active_boundary_id = boundary_id;
-        self.dead_sector_clock.reset(None);
+        self.image_timing.reset();
         sink.on_event(FaxPaperEventRef::Boundary {
             paper_id: self.paper_id,
             boundary_id,
@@ -1192,7 +1215,7 @@ fn acquisition_decoder(
         FaxDecoderConfig {
             immediate_decode: false,
             clock_recovery: paper.clock_recovery,
-            raster_basis: FaxRasterBasis::NominalPaper,
+            raster_basis: FaxRasterBasis::Calibrated,
             ioc: locked.map(|spec| spec.ioc),
             lpm: locked.map(|spec| spec.lpm),
             modulation,
@@ -1227,32 +1250,33 @@ fn same_decode_spec(left: FaxSpec, right: FaxSpec) -> bool {
 #[cfg(test)]
 mod clock_tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
-    fn joint_dead_sector_search_recovers_midstream_phase_and_small_clock_error() {
+    fn image_timing_recovers_midstream_phase_and_small_clock_error() {
         let spec = FaxSpec::standard(FaxIoc::Ioc288, FaxLpm::LPM_120);
         let width = spec.width() as usize;
-        let sector = width - spec.active_width() as usize;
+        let margin = ((width as f64 * IMAGE_TIMING_MARGIN_FRACTION).round() as usize).max(1);
         let base_phase = 230.0_f64;
         let expected_ppm = 37.0_f64;
-        let mut tracker = DeadSectorClockTracker::default();
+        let mut tracker = ImageTimingTracker::default();
         let mut latest = None;
-        for line in 0..160_u64 {
+        for line in 0..320_u64 {
             let mut row = vec![0_u8; width];
             for (column, value) in row.iter_mut().enumerate() {
                 *value = 72 + ((column as u64 * 17 + line * 29) % 144) as u8;
             }
             let correction = base_phase + line as f64 * expected_ppm * width as f64 / 1_000_000.0;
             let observed = wrap_column(
-                (f64::from(spec.active_width()) - correction).round() as i64,
+                (width as f64 - margin as f64 - correction).round() as i64,
                 width,
             );
-            for offset in 0..sector {
+            for offset in 0..margin {
                 row[(observed + offset) % width] = (line % 3) as u8;
             }
             latest = tracker.observe(line, spec, &row).or(latest);
         }
-        let point = latest.expect("dead-sector calibration");
+        let point = latest.expect("image-content calibration");
         let expected_phase =
             base_phase + point.reference_line as f64 * expected_ppm * width as f64 / 1_000_000.0;
         assert!(
@@ -1262,6 +1286,42 @@ mod clock_tests {
         assert!(
             (f64::from(point.clock_ppm) - expected_ppm).abs() <= 6.0,
             "point={point:?}"
+        );
+    }
+
+    #[test]
+    fn robust_model_rejects_an_isolated_phase_outlier() {
+        let width = 1_810.0;
+        let expected_ppm = 42.0;
+        let mut measurements = VecDeque::new();
+        for index in 0..17_u64 {
+            let line = index * IMAGE_TIMING_TRACKING_STRIDE;
+            let noise = match index % 4 {
+                0 => -0.3,
+                1 => 0.2,
+                2 => 0.1,
+                _ => -0.1,
+            };
+            let outlier = if index == 9 { 18.0 } else { 0.0 };
+            measurements.push_back(ImageTimingObservation {
+                reference_line: line,
+                phase_pixels: 27.0
+                    + line as f64 * expected_ppm * width / 1_000_000.0
+                    + noise
+                    + outlier,
+                clock_ppm: expected_ppm,
+                confidence: 0.8,
+            });
+        }
+        let model = robust_image_timing_model(&measurements, 512, width).unwrap();
+        let expected_phase = 27.0 + 512.0 * expected_ppm * width / 1_000_000.0;
+        assert!(
+            (model.phase_pixels - expected_phase).abs() < 0.5,
+            "model={model:?}"
+        );
+        assert!(
+            (model.clock_ppm - expected_ppm).abs() < 2.0,
+            "model={model:?}"
         );
     }
 }

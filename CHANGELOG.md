@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-27
+
+- Separate trusted phasing recovery from conservative image-content timing:
+  phasing captures now cut calibrated rows directly and cannot be retimed by
+  later map content.
+- Replace per-window phase/ppm searches with a bounded observation history,
+  robust affine fit, innovation gate, low-bandwidth clock update, and sparse
+  model publication for mid-image joins.
+- Keep overall image-content phase fixed after acquisition, use integer phase
+  when the evidence is raster-quantized, and freeze on unstable observations.
+- Evaluate sparse timing models with slope-continuous interpolation and a
+  four-sample fractional-delay filter instead of repeatedly blending adjacent
+  pixels linearly.
+- Correct radiofax image geometry to use the complete `round(pi * IOC)` line;
+  the 5% interval belongs to phasing and is no longer injected into image rows.
+- Replace the misleading `DeadSector` clock source with `ImageContent` and
+  document that content-based timing is heuristic rather than a protocol lock.
+
 ## 0.4.0 - 2026-08-26
 
 - Add an opt-in SSTV transmission envelope with QSSTV-compatible calibration

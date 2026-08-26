@@ -110,6 +110,10 @@ crate version 0.1.0. "Primary" below maps to the public
   <https://www.iso.org/standard/66059.html>
 - NOAA worldwide marine radiofacsimile schedule (2025-03-07):
   <https://www.weather.gov/media/marine/rfax.pdf>
+- fldigi WEFAX implementation and user documentation, used as an
+  interoperability reference for phasing, full-width image scanning, and
+  conservative auto-alignment behavior:
+  <https://github.com/w1hkj/fldigi/tree/master/src/wefax>
 
 ## Radiofax Geometry
 
@@ -121,21 +125,17 @@ T_line = 60 / LPM seconds
 ```
 
 `L` is full scan-line length and `F` is scanning density. IOC is not a pixel
-count. With square sampling, Rasterwave uses these explicit full and active
-widths:
+count. With square sampling, Rasterwave uses these explicit image widths:
 
 ```text
 IOC                         288    576
-full raster samples         905   1810
-active picture samples      864   1728
+image-line samples          905   1810
 ```
 
-The full raster includes the 4.5% phasing/dead sector. `FaxEncoder` accepts a
-`GrayImage` at either the active width (recommended) or the full width. In both
-cases it generates the reserved sector itself; pixels supplied beyond the
-active width in a full-raster input are replaced by the white phasing level.
-`FaxDecoder::LineReady` always returns a full-width row, so consumers that need
-only the picture crop it to `FaxIoc::active_width()`.
+The approximately 5% white interval belongs to each phasing line, surrounded
+by black (or the inverted equivalent). It must not be synthesized over every
+image line. `FaxEncoder` therefore accepts a full-width `GrayImage`, and
+`FaxDecoder::LineReady` returns the same full image-line width.
 
 WMO FM maps black=1500 Hz and white=2300 Hz around a 1900 Hz center. IOC
 selection alternates black/white levels with a 300 or 675 Hz rectangular

@@ -17,6 +17,16 @@ fn test_image(ioc: FaxIoc, lines: u32) -> GrayImage {
     GrayImage::new(width, lines, pixels).unwrap()
 }
 
+fn image_with_stable_margin(ioc: FaxIoc, lines: u32) -> GrayImage {
+    let width = ioc.width() as usize;
+    let margin = (width as f64 * 0.045).round() as usize;
+    let mut pixels = test_image(ioc, lines).pixels().to_vec();
+    for row in pixels.chunks_exact_mut(width) {
+        row[width - margin..].fill(0);
+    }
+    GrayImage::new(ioc.width(), lines, pixels).unwrap()
+}
+
 fn encoded(mut spec: FaxSpec, lines: u32) -> Vec<f32> {
     spec.start_seconds = 1.0;
     spec.phasing_seconds = 3.0;
@@ -34,6 +44,20 @@ fn encoded(mut spec: FaxSpec, lines: u32) -> Vec<f32> {
     while !encoder.is_finished() {
         let count = encoder.read_samples(&mut chunk);
         output.extend_from_slice(&chunk[..count]);
+    }
+    output
+}
+
+fn stretch_clock(input: &[f32], clock_ppm: f64) -> Vec<f32> {
+    let scale = 1.0 + clock_ppm / 1_000_000.0;
+    let output_len = (input.len() as f64 * scale).round() as usize;
+    let mut output = Vec::with_capacity(output_len);
+    for index in 0..output_len {
+        let source = index as f64 / scale;
+        let left = source.floor() as usize;
+        let right = (left + 1).min(input.len().saturating_sub(1));
+        let fraction = (source - left as f64) as f32;
+        output.push(input[left] + (input[right] - input[left]) * fraction);
     }
     output
 }
@@ -168,6 +192,8 @@ fn fm_self_decode_marks_apt_boundary_completes_and_continues() {
     assert_eq!(completion.1, trusted.1);
     assert_eq!(completion.2 - completion.1, u64::from(completion.3));
     assert!(events[completion_position..].iter().any(|event| matches!(event, FaxPaperEvent::LineReady { line_index, .. } if *line_index >= completion.2)));
+    assert!(events.iter().any(|event| matches!(event, FaxPaperEvent::LineReady { boundary_id, basis: rasterwave::fax::FaxRasterBasis::Calibrated, .. } if *boundary_id == trusted.0)));
+    assert!(!events.iter().any(|event| matches!(event, FaxPaperEvent::ClockCalibration { boundary_id, calibration, .. } if *boundary_id == trusted.0 && calibration.source == FaxClockSource::ImageContent)));
 }
 
 #[test]
@@ -231,14 +257,9 @@ fn manual_lock_reports_mismatched_fax_header() {
 }
 
 #[test]
-fn image_dead_sector_recovers_midstream_horizontal_phase() {
+fn image_content_recovers_midstream_horizontal_phase() {
     let spec = FaxSpec::standard(FaxIoc::Ioc288, FaxLpm::LPM_240);
-    let image = GrayImage::new(
-        spec.active_width(),
-        160,
-        vec![128; spec.active_width() as usize * 160],
-    )
-    .unwrap();
+    let image = image_with_stable_margin(spec.ioc, 320);
     let mut encoder = FaxEncoder::new(
         image,
         spec,
@@ -268,7 +289,7 @@ fn image_dead_sector_recovers_midstream_horizontal_phase() {
     feed(&mut decoder, &samples, &mut events);
     let calibration = events.iter().find_map(|event| match event {
         FaxPaperEvent::ClockCalibration { calibration, .. }
-            if calibration.source == FaxClockSource::DeadSector =>
+            if calibration.source == FaxClockSource::ImageContent =>
         {
             Some(calibration)
         }
@@ -276,4 +297,98 @@ fn image_dead_sector_recovers_midstream_horizontal_phase() {
     });
     assert!(calibration.is_some(), "events: {events:?}");
     assert!(calibration.unwrap().phase_pixels.abs() > 20.0);
+}
+
+#[test]
+fn image_only_content_without_a_stable_margin_keeps_nominal_timing() {
+    let spec = FaxSpec::standard(FaxIoc::Ioc288, FaxLpm::LPM_240);
+    let mut encoder = FaxEncoder::new(
+        test_image(spec.ioc, 320),
+        spec,
+        12_000,
+        FaxEncodeOptions {
+            include_apt: false,
+            include_phasing: false,
+            ..FaxEncodeOptions::default()
+        },
+    )
+    .unwrap();
+    let mut samples = Vec::new();
+    let mut chunk = [0.0_f32; 1_200];
+    while !encoder.is_finished() {
+        let count = encoder.read_samples(&mut chunk);
+        samples.extend_from_slice(&chunk[..count]);
+    }
+    let mut decoder = FaxPaperDecoder::new(
+        12_000,
+        FaxPaperConfig {
+            mode: FaxPaperMode::Manual { spec },
+            ..FaxPaperConfig::default()
+        },
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    feed(&mut decoder, &samples, &mut events);
+    assert!(!events.iter().any(|event| matches!(event, FaxPaperEvent::ClockCalibration { calibration, .. } if calibration.source == FaxClockSource::ImageContent)));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        FaxPaperEvent::LineReady {
+            basis: rasterwave::fax::FaxRasterBasis::NominalPaper,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn self_encoded_paper_recovers_a_stretched_source_clock_without_dense_updates() {
+    let spec = FaxSpec::standard(FaxIoc::Ioc288, FaxLpm::LPM_240);
+    let image = image_with_stable_margin(spec.ioc, 480);
+    let mut encoder = FaxEncoder::new(
+        image,
+        spec,
+        12_000,
+        FaxEncodeOptions {
+            include_apt: false,
+            include_phasing: false,
+            ..FaxEncodeOptions::default()
+        },
+    )
+    .unwrap();
+    let mut pcm = Vec::new();
+    let mut chunk = [0.0_f32; 4096];
+    while !encoder.is_finished() {
+        let count = encoder.read_samples(&mut chunk);
+        pcm.extend_from_slice(&chunk[..count]);
+    }
+    let warped = stretch_clock(&pcm, 400.0);
+    let mut decoder = FaxPaperDecoder::new(
+        12_000,
+        FaxPaperConfig {
+            mode: FaxPaperMode::Manual { spec },
+            ..FaxPaperConfig::default()
+        },
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    feed(&mut decoder, &warped, &mut events);
+    let points: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            FaxPaperEvent::ClockCalibration { calibration, .. }
+                if calibration.source == FaxClockSource::ImageContent =>
+            {
+                Some(*calibration)
+            }
+            _ => None,
+        })
+        .collect();
+    let latest = points.last().expect("clock model");
+    assert!(
+        (f64::from(latest.clock_ppm).abs() - 400.0).abs() <= 80.0,
+        "latest={latest:?}, points={points:?}"
+    );
+    assert!(
+        points.len() <= 5,
+        "clock model updates must remain sparse: {points:?}"
+    );
 }

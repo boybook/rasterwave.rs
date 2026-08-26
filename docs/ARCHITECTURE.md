@@ -85,8 +85,8 @@ image rows -> confirmed APT stop | max-lines | EOF | signal-loss
 
 IOC is not a fixed image size. The built-in square-sampling policy derives a
 full line width, while page height remains open until stop or a configured
-limit. The encoder accepts either active-picture or full-raster input; the
-decoder emits full-raster rows. APT and suspected stop samples are held until
+limit. The encoder and decoder use the complete `round(pi * IOC)` image line.
+APT and suspected stop samples are held until
 the control pattern is confirmed so they are not exposed as image pixels.
 
 The default acquisition path detects IOC from APT and WMO line rates from
@@ -115,12 +115,19 @@ phasing duration cannot introduce a separate horizontal offset. Rejected
 phasing cycles invalidate pending untrusted measurements instead of allowing a
 stale period to start a page.
 
-Continuous fax paper keeps a stable nominal-LPM coordinate basis. Clock
-calibration points describe the horizontal correction at a reference line and
-its ppm slope; later image dead-sector evidence may add tracking points.
-`correct_fax_paper` treats rows as one flattened raster while applying that
-model, so a shear may sample across row boundaries without a visible seam.
-Framed output continues to cut lines directly with the recovered clock.
+Continuous fax paper has two explicit timing paths. Before a protocol lock, it
+emits immediate `NominalPaper` rows. A trusted phasing capture uses the fitted
+period directly and emits `Calibrated` rows; image content is not allowed to
+retime that segment. For a mid-image join, a separate bounded image-content
+tracker may publish a sparse affine model only after at least five consistent
+observations over a long span. It freezes on large innovations and never treats
+ordinary image structure as protocol evidence.
+
+`correct_fax_paper` applies only to nominal rows. It evaluates sparse timing
+models with slope-continuous interpolation and a four-sample fractional-delay
+filter, so integer shifts remain exact and necessary fractional correction does
+not receive a second linear blur. Consumers must not apply this transform to
+rows whose basis is already `Calibrated`.
 
 ## Threading And Future Node.js Binding
 

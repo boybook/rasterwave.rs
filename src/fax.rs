@@ -45,14 +45,6 @@ impl FaxIoc {
         }
     }
 
-    /// Conventional active picture width after the 4.5% phasing/dead sector.
-    pub const fn active_width(self) -> u32 {
-        match self {
-            Self::Ioc288 => 864,
-            Self::Ioc576 => 1728,
-        }
-    }
-
     const fn apt_start_hz(self) -> f64 {
         match self {
             Self::Ioc288 => START_IOC_288_HZ,
@@ -161,8 +153,6 @@ pub struct FaxSpec {
     pub stop_seconds: f32,
     /// Continuous black tail following the stop pattern.
     pub trailing_black_seconds: f32,
-    /// Fraction of each line reserved as the dead sector.
-    pub dead_sector_fraction: f32,
 }
 
 /// Automatic radiofax clock-recovery policy.
@@ -182,8 +172,8 @@ pub enum FaxClockSource {
     Nominal,
     /// APT phasing lines established timing.
     Phasing,
-    /// The repeated image dead sector refined timing.
-    DeadSector,
+    /// Conservative timing inferred from stable image margins or content.
+    ImageContent,
     /// A caller supplied an additive adjustment.
     Manual,
 }
@@ -270,22 +260,12 @@ impl FaxSpec {
             start_seconds: 5.0,
             stop_seconds: 5.0,
             trailing_black_seconds: 10.0,
-            dead_sector_fraction: 0.045,
         }
     }
 
-    /// Full square-sampling raster width, including the dead sector.
+    /// Full square-sampling raster width.
     pub const fn width(self) -> u32 {
         self.ioc.width()
-    }
-
-    /// Active picture width before the dead sector.
-    pub fn active_width(self) -> u32 {
-        if (self.dead_sector_fraction - 0.045).abs() <= f32::EPSILON {
-            self.ioc.active_width()
-        } else {
-            (f64::from(self.width()) * (1.0 - f64::from(self.dead_sector_fraction))).round() as u32
-        }
     }
 
     /// Number of phasing lines implied by duration and LPM.
@@ -352,9 +332,7 @@ pub struct FaxEncoder {
 impl FaxEncoder {
     /// Construct a streaming radiofax encoder.
     ///
-    /// The image may use [`FaxSpec::active_width`] (recommended) or the full
-    /// [`FaxSpec::width`]. When a full-width image is supplied, pixels in the
-    /// dead sector are intentionally replaced with white phasing level.
+    /// The image width must equal [`FaxSpec::width`].
     pub fn new(
         image: GrayImage,
         spec: FaxSpec,
@@ -363,9 +341,9 @@ impl FaxEncoder {
     ) -> Result<Self> {
         validate_rate(sample_rate)?;
         validate_spec(spec, sample_rate.min(WORK_SAMPLE_RATE))?;
-        if image.width() != spec.width() && image.width() != spec.active_width() {
+        if image.width() != spec.width() {
             return Err(Error::InvalidConfiguration(
-                "radiofax image width must equal the active or full IOC width",
+                "radiofax image width must equal the full IOC width",
             ));
         }
         if !(0.0..=1.0).contains(&options.amplitude) {
@@ -499,12 +477,8 @@ impl FaxEncoder {
                     return self.next_segment();
                 }
                 let width = self.spec.width();
-                let dead_sector_start = self.spec.active_width();
-                let value = if pixel >= dead_sector_start {
-                    255
-                } else {
-                    self.image.pixels()[row as usize * self.image.width() as usize + pixel as usize]
-                };
+                let value = self.image.pixels()
+                    [row as usize * self.image.width() as usize + pixel as usize];
                 let next_pixel = pixel + 1;
                 self.stage = if next_pixel >= width {
                     FaxEncodeStage::Image {
@@ -1983,13 +1957,7 @@ pub fn correct_fax_paper(
             if source < 0.0 || source > (pixels.len() - 1) as f64 {
                 continue;
             }
-            let left = source.floor() as usize;
-            let right = (left + 1).min(pixels.len() - 1);
-            let fraction = source - left as f64;
-            output[target] = (f64::from(pixels[left])
-                + (f64::from(pixels[right]) - f64::from(pixels[left])) * fraction)
-                .round()
-                .clamp(0.0, 255.0) as u8;
+            output[target] = sample_fax_gray(pixels, source);
         }
     }
     Ok(output)
@@ -2010,12 +1978,45 @@ fn calibration_phase(points: &[FaxClockCalibrationPoint], line: u64, width: f64)
             .saturating_sub(left.reference_line)
             .max(1) as f64;
         let progress = line.saturating_sub(left.reference_line) as f64 / span;
-        return f64::from(left.phase_pixels)
-            + (f64::from(right.phase_pixels) - f64::from(left.phase_pixels)) * progress;
+        let progress2 = progress * progress;
+        let progress3 = progress2 * progress;
+        let left_slope = f64::from(left.clock_ppm) * width / 1_000_000.0;
+        let right_slope = f64::from(right.clock_ppm) * width / 1_000_000.0;
+        return (2.0 * progress3 - 3.0 * progress2 + 1.0) * f64::from(left.phase_pixels)
+            + (progress3 - 2.0 * progress2 + progress) * span * left_slope
+            + (-2.0 * progress3 + 3.0 * progress2) * f64::from(right.phase_pixels)
+            + (progress3 - progress2) * span * right_slope;
     }
     f64::from(left.phase_pixels)
         + line.saturating_sub(left.reference_line) as f64 * f64::from(left.clock_ppm) * width
             / 1_000_000.0
+}
+
+fn sample_fax_gray(pixels: &[u8], source: f64) -> u8 {
+    let center = source.floor() as isize;
+    let fraction = source - center as f64;
+    if fraction <= 1.0e-9 {
+        return pixels[center as usize];
+    }
+    let sample = |index: isize| -> f64 {
+        if index < 0 || index >= pixels.len() as isize {
+            255.0
+        } else {
+            f64::from(pixels[index as usize])
+        }
+    };
+    let before = sample(center - 1);
+    let left = sample(center);
+    let right = sample(center + 1);
+    let after = sample(center + 2);
+    let fraction2 = fraction * fraction;
+    let fraction3 = fraction2 * fraction;
+    (0.5 * (2.0 * left
+        + (-before + right) * fraction
+        + (2.0 * before - 5.0 * left + 4.0 * right - after) * fraction2
+        + (-before + 3.0 * left - 3.0 * right + after) * fraction3))
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 fn emit_available_fax_lines(
@@ -2196,12 +2197,6 @@ fn validate_spec(spec: FaxSpec, sample_rate: u32) -> Result<()> {
     {
         return Err(Error::InvalidConfiguration(
             "radiofax APT durations must be finite and in 0.0..=600",
-        ));
-    }
-    if !spec.dead_sector_fraction.is_finite() || !(0.0..=0.25).contains(&spec.dead_sector_fraction)
-    {
-        return Err(Error::InvalidConfiguration(
-            "radiofax dead_sector_fraction must be in 0.0..=0.25",
         ));
     }
     validate_modulation(spec.modulation, sample_rate)
@@ -2426,8 +2421,7 @@ mod tests {
     #[test]
     fn fax_numeric_validation_rejects_non_finite_and_aliased_parameters() {
         let ioc = FaxIoc::Ioc288;
-        let image =
-            GrayImage::new(ioc.active_width(), 1, vec![0; ioc.active_width() as usize]).unwrap();
+        let image = GrayImage::new(ioc.width(), 1, vec![0; ioc.width() as usize]).unwrap();
         let mut infinite = FaxSpec::standard(ioc, FaxLpm::LPM_120);
         infinite.stop_seconds = f32::INFINITY;
         assert!(
