@@ -66,6 +66,12 @@ single cumulative sample deadline. It creates tone or pixel segments lazily and
 fills caller memory directly. The oscillator is phase-continuous across pixels,
 segments, and caller chunk boundaries.
 
+The optional transmission envelope is a separate ordered state machine around
+that raster. It can prepend QSSTV calibration tones and append a silence gap,
+FSK/CW station ID, and final guard. The legacy constructor selects an empty
+envelope, while progress snapshots expose exact raster sample boundaries for
+monitoring and loopback decoders.
+
 ## Radiofax Boundary
 
 Radiofax shares PCM, oscillator, demodulation, and raster primitives with SSTV

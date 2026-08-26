@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::color::rgb_to_yuv;
 use crate::oscillator::Oscillator;
 use crate::vis::with_even_parity;
@@ -10,6 +12,8 @@ const SYNC_HZ: f64 = 1200.0;
 const PORCH_HZ: f64 = 1500.0;
 const PIXEL_LOW_HZ: f64 = 1500.0;
 const PIXEL_BANDWIDTH_HZ: f64 = 800.0;
+const ENHANCED_PREAMBLE_SECONDS: f64 = 0.800;
+const CW_RAMP_SECONDS: f64 = 0.003;
 
 /// Options controlling an SSTV transmission.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,6 +39,68 @@ impl Default for EncodeOptions {
     }
 }
 
+/// Optional station identification appended to an SSTV raster.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SstvStationId {
+    /// Do not append station identification.
+    None,
+    /// Append a QSSTV/DL3YAP-compatible 6-bit FSK identifier.
+    Fsk {
+        /// Amateur-radio callsign to transmit.
+        callsign: String,
+    },
+    /// Append an audible Morse identifier.
+    Cw {
+        /// Amateur-radio callsign to transmit.
+        callsign: String,
+        /// Morse speed in words per minute.
+        wpm: u16,
+        /// CW audio tone frequency.
+        tone_hz: f32,
+    },
+}
+
+/// Optional tones and silence surrounding a standard SSTV raster.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SstvTransmissionEnvelope {
+    /// Emit the QSSTV-compatible eight-tone calibration preamble before VIS.
+    pub enhanced_preamble: bool,
+    /// Station identification emitted after the raster.
+    pub station_id: SstvStationId,
+    /// Silence inserted between the raster and station identification.
+    pub post_image_gap_seconds: f64,
+    /// Silence emitted after all station identification.
+    pub end_guard_seconds: f64,
+}
+
+impl Default for SstvTransmissionEnvelope {
+    fn default() -> Self {
+        Self {
+            enhanced_preamble: false,
+            station_id: SstvStationId::None,
+            post_image_gap_seconds: 0.0,
+            end_guard_seconds: 0.0,
+        }
+    }
+}
+
+/// Current portion of an SSTV transmission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderStage {
+    /// Optional enhanced calibration tones.
+    Preamble,
+    /// Standard calibration leader and VIS word.
+    Vis,
+    /// Mode-specific image raster.
+    Raster,
+    /// Post-raster station identification and its leading gap.
+    StationId,
+    /// Final keyed-transmitter silence.
+    Guard,
+    /// No samples remain.
+    Finished,
+}
+
 /// Snapshot returned by [`SstvEncoder::progress`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncoderProgress {
@@ -44,6 +110,12 @@ pub struct EncoderProgress {
     pub estimated_total_samples: u64,
     /// Current image row, when image scanning has begun.
     pub current_row: Option<u32>,
+    /// Current transmission portion.
+    pub stage: EncoderStage,
+    /// First sample belonging to the mode-specific raster.
+    pub raster_start_sample: u64,
+    /// Exclusive end sample of the mode-specific raster.
+    pub raster_end_sample: u64,
     /// Whether the encoder has reached the end of the image.
     pub finished: bool,
 }
@@ -73,8 +145,18 @@ enum Stage {
 
 #[derive(Clone, Copy, Debug)]
 struct ActiveSegment {
-    frequency_hz: f64,
+    frequency_hz: Option<f64>,
+    total_samples: usize,
     remaining_samples: usize,
+    ramp_samples: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueuedSegment {
+    frequency_hz: Option<f64>,
+    seconds: f64,
+    ramp_seconds: f64,
+    stage: EncoderStage,
 }
 
 /// Incremental, phase-continuous SSTV encoder.
@@ -88,6 +170,8 @@ pub struct SstvEncoder {
     sample_rate: u32,
     options: EncodeOptions,
     oscillator: Oscillator,
+    preamble: VecDeque<QueuedSegment>,
+    trailer: VecDeque<QueuedSegment>,
     header_stage: HeaderStage,
     body_prefix_pending: bool,
     radio_line: u32,
@@ -99,6 +183,9 @@ pub struct SstvEncoder {
     scan_stage_total_samples: u64,
     emitted: u64,
     estimated_total: u64,
+    raster_start_sample: u64,
+    raster_end_sample: u64,
+    stage: EncoderStage,
     finished: bool,
 }
 
@@ -109,6 +196,23 @@ impl SstvEncoder {
         mode: SstvMode,
         sample_rate: u32,
         options: EncodeOptions,
+    ) -> Result<Self> {
+        Self::new_with_envelope(
+            image,
+            mode,
+            sample_rate,
+            options,
+            SstvTransmissionEnvelope::default(),
+        )
+    }
+
+    /// Construct a streaming encoder with an optional transmission envelope.
+    pub fn new_with_envelope(
+        image: RgbImage,
+        mode: SstvMode,
+        sample_rate: u32,
+        options: EncodeOptions,
+        envelope: SstvTransmissionEnvelope,
     ) -> Result<Self> {
         validate_sample_rate(sample_rate)?;
         if !(0.0..=1.0).contains(&options.amplitude) {
@@ -121,6 +225,7 @@ impl SstvEncoder {
                 "tone_offset_hz must be finite and within +/-500 Hz",
             ));
         }
+        validate_envelope(&options, &envelope)?;
 
         let spec = mode.spec();
         if image.width() != spec.width || image.height() != spec.height {
@@ -146,8 +251,25 @@ impl SstvEncoder {
             } else {
                 0.0
             };
-        let estimated_total =
-            ((header_seconds + body_seconds) * f64::from(sample_rate)).round() as u64;
+        let preamble = build_preamble(&envelope);
+        let trailer = build_trailer(&envelope);
+        let preamble_seconds = preamble.iter().map(|segment| segment.seconds).sum::<f64>();
+        let trailer_seconds = trailer.iter().map(|segment| segment.seconds).sum::<f64>();
+        let raster_start_sample =
+            ((preamble_seconds + header_seconds) * f64::from(sample_rate)).round() as u64;
+        let raster_end_sample = ((preamble_seconds + header_seconds + body_seconds)
+            * f64::from(sample_rate))
+        .round() as u64;
+        let estimated_total = ((preamble_seconds + header_seconds + body_seconds + trailer_seconds)
+            * f64::from(sample_rate))
+        .round() as u64;
+        let stage = if !preamble.is_empty() {
+            EncoderStage::Preamble
+        } else if options.include_vis_header {
+            EncoderStage::Vis
+        } else {
+            EncoderStage::Raster
+        };
 
         Ok(Self {
             image,
@@ -155,6 +277,8 @@ impl SstvEncoder {
             sample_rate,
             options,
             oscillator: Oscillator::default(),
+            preamble,
+            trailer,
             header_stage: if options.include_vis_header {
                 HeaderStage::Leader1
             } else {
@@ -170,6 +294,9 @@ impl SstvEncoder {
             scan_stage_total_samples: 0,
             emitted: 0,
             estimated_total,
+            raster_start_sample,
+            raster_end_sample,
+            stage,
             finished: false,
         })
     }
@@ -194,12 +321,28 @@ impl SstvEncoder {
 
             let active = self.active.as_mut().expect("active segment was created");
             let count = active.remaining_samples.min(output.len() - written);
-            self.oscillator.fill(
-                &mut output[written..written + count],
-                active.frequency_hz + f64::from(self.options.tone_offset_hz),
-                self.sample_rate,
-                self.options.amplitude,
-            );
+            let destination = &mut output[written..written + count];
+            if let Some(frequency_hz) = active.frequency_hz {
+                if active.ramp_samples > 0 {
+                    self.oscillator.fill_ramped(
+                        destination,
+                        frequency_hz + f64::from(self.options.tone_offset_hz),
+                        self.sample_rate,
+                        self.options.amplitude,
+                        active.total_samples - active.remaining_samples..active.total_samples,
+                        active.ramp_samples,
+                    );
+                } else {
+                    self.oscillator.fill(
+                        destination,
+                        frequency_hz + f64::from(self.options.tone_offset_hz),
+                        self.sample_rate,
+                        self.options.amplitude,
+                    );
+                }
+            } else {
+                destination.fill(0.0);
+            }
             active.remaining_samples -= count;
             written += count;
             self.emitted += count as u64;
@@ -231,6 +374,9 @@ impl SstvEncoder {
             estimated_total_samples: self.estimated_total,
             current_row: (!self.header_pending() && self.radio_line < self.radio_line_count())
                 .then_some(self.radio_line * u32::from(spec.rows_per_line)),
+            stage: self.stage,
+            raster_start_sample: self.raster_start_sample,
+            raster_end_sample: self.raster_end_sample,
             finished: self.finished,
         }
     }
@@ -245,10 +391,22 @@ impl SstvEncoder {
     }
 
     fn next_segment(&mut self) -> Option<ActiveSegment> {
+        if let Some(segment) = self.preamble.pop_front() {
+            return Some(self.queued_segment(segment));
+        }
         if let Some(segment) = self.next_header_segment() {
+            self.stage = EncoderStage::Vis;
             return Some(segment);
         }
-        self.next_body_segment()
+        if let Some(segment) = self.next_body_segment() {
+            self.stage = EncoderStage::Raster;
+            return Some(segment);
+        }
+        if let Some(segment) = self.trailer.pop_front() {
+            return Some(self.queued_segment(segment));
+        }
+        self.stage = EncoderStage::Finished;
+        None
     }
 
     fn next_header_segment(&mut self) -> Option<ActiveSegment> {
@@ -315,8 +473,10 @@ impl SstvEncoder {
                     self.advance_body_stage();
                 }
                 Some(ActiveSegment {
-                    frequency_hz: pixel_frequency(value),
+                    frequency_hz: Some(pixel_frequency(value)),
+                    total_samples: end.saturating_sub(start) as usize,
                     remaining_samples: end.saturating_sub(start) as usize,
+                    ramp_samples: 0,
                 })
             }
         }
@@ -331,9 +491,23 @@ impl SstvEncoder {
     }
 
     fn timed_segment(&mut self, frequency_hz: f64, seconds: f64) -> ActiveSegment {
+        let total_samples = self.schedule_duration(seconds) as usize;
         ActiveSegment {
-            frequency_hz,
-            remaining_samples: self.schedule_duration(seconds) as usize,
+            frequency_hz: Some(frequency_hz),
+            total_samples,
+            remaining_samples: total_samples,
+            ramp_samples: 0,
+        }
+    }
+
+    fn queued_segment(&mut self, segment: QueuedSegment) -> ActiveSegment {
+        self.stage = segment.stage;
+        let total_samples = self.schedule_duration(segment.seconds) as usize;
+        ActiveSegment {
+            frequency_hz: segment.frequency_hz,
+            total_samples,
+            remaining_samples: total_samples,
+            ramp_samples: (segment.ramp_seconds * f64::from(self.sample_rate)).round() as usize,
         }
     }
 
@@ -667,6 +841,232 @@ fn validate_sample_rate(sample_rate: u32) -> Result<()> {
     Ok(())
 }
 
+fn validate_envelope(options: &EncodeOptions, envelope: &SstvTransmissionEnvelope) -> Result<()> {
+    if envelope.enhanced_preamble && !options.include_vis_header {
+        return Err(Error::InvalidConfiguration(
+            "enhanced_preamble requires include_vis_header",
+        ));
+    }
+    for (value, name) in [
+        (envelope.post_image_gap_seconds, "post_image_gap_seconds"),
+        (envelope.end_guard_seconds, "end_guard_seconds"),
+    ] {
+        if !value.is_finite() || !(0.0..=5.0).contains(&value) {
+            return Err(Error::InvalidConfiguration(match name {
+                "post_image_gap_seconds" => {
+                    "post_image_gap_seconds must be finite and within 0..=5 seconds"
+                }
+                _ => "end_guard_seconds must be finite and within 0..=5 seconds",
+            }));
+        }
+    }
+    match &envelope.station_id {
+        SstvStationId::None => Ok(()),
+        SstvStationId::Fsk { callsign } => validate_callsign(callsign),
+        SstvStationId::Cw {
+            callsign,
+            wpm,
+            tone_hz,
+        } => {
+            validate_callsign(callsign)?;
+            if !(5..=60).contains(wpm) {
+                return Err(Error::InvalidConfiguration("CW WPM must be within 5..=60"));
+            }
+            if !tone_hz.is_finite() || !(400.0..=2300.0).contains(tone_hz) {
+                return Err(Error::InvalidConfiguration(
+                    "CW tone_hz must be finite and within 400..=2300 Hz",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_callsign(callsign: &str) -> Result<()> {
+    if callsign.is_empty()
+        || callsign.len() > 16
+        || !callsign
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'/')
+    {
+        return Err(Error::InvalidConfiguration(
+            "station callsign must contain 1..=16 uppercase A-Z, 0-9, or / characters",
+        ));
+    }
+    Ok(())
+}
+
+fn build_preamble(envelope: &SstvTransmissionEnvelope) -> VecDeque<QueuedSegment> {
+    if !envelope.enhanced_preamble {
+        return VecDeque::new();
+    }
+    [
+        1900.0, 1500.0, 1900.0, 1500.0, 2300.0, 1500.0, 2300.0, 1500.0,
+    ]
+    .into_iter()
+    .map(|frequency_hz| QueuedSegment {
+        frequency_hz: Some(frequency_hz),
+        seconds: ENHANCED_PREAMBLE_SECONDS / 8.0,
+        ramp_seconds: 0.0,
+        stage: EncoderStage::Preamble,
+    })
+    .collect()
+}
+
+fn build_trailer(envelope: &SstvTransmissionEnvelope) -> VecDeque<QueuedSegment> {
+    let mut segments = VecDeque::new();
+    if !matches!(envelope.station_id, SstvStationId::None) {
+        push_silence(
+            &mut segments,
+            envelope.post_image_gap_seconds,
+            EncoderStage::StationId,
+        );
+        match &envelope.station_id {
+            SstvStationId::None => {}
+            SstvStationId::Fsk { callsign } => push_fsk_id(&mut segments, callsign),
+            SstvStationId::Cw {
+                callsign,
+                wpm,
+                tone_hz,
+            } => push_cw_id(&mut segments, callsign, *wpm, f64::from(*tone_hz)),
+        }
+    }
+    push_silence(
+        &mut segments,
+        envelope.end_guard_seconds,
+        EncoderStage::Guard,
+    );
+    segments
+}
+
+fn push_fsk_id(segments: &mut VecDeque<QueuedSegment>, callsign: &str) {
+    push_tone(segments, 1500.0, 0.300, EncoderStage::StationId, false);
+    push_tone(segments, 2100.0, 0.100, EncoderStage::StationId, false);
+    push_tone(segments, 1900.0, 0.022, EncoderStage::StationId, false);
+    push_fsk_character(segments, 0x2a);
+    let mut checksum = 0_u8;
+    for byte in callsign.bytes() {
+        let value = byte - 0x20;
+        checksum ^= value;
+        push_fsk_character(segments, value);
+    }
+    push_fsk_character(segments, 0x01);
+    push_fsk_character(segments, checksum & 0x3f);
+    push_tone(segments, 1900.0, 0.100, EncoderStage::StationId, false);
+}
+
+fn push_fsk_character(segments: &mut VecDeque<QueuedSegment>, value: u8) {
+    for bit in 0..6 {
+        let frequency_hz = if value & (1 << bit) != 0 {
+            1900.0
+        } else {
+            2100.0
+        };
+        push_tone(
+            segments,
+            frequency_hz,
+            0.022,
+            EncoderStage::StationId,
+            false,
+        );
+    }
+}
+
+fn push_cw_id(segments: &mut VecDeque<QueuedSegment>, callsign: &str, wpm: u16, tone_hz: f64) {
+    let dot_seconds = 1.2 / f64::from(wpm);
+    for (character_index, character) in callsign.chars().enumerate() {
+        if character_index > 0 {
+            push_silence(segments, dot_seconds * 3.0, EncoderStage::StationId);
+        }
+        let code = callsign_morse(character);
+        for (symbol_index, symbol) in code.bytes().enumerate() {
+            if symbol_index > 0 {
+                push_silence(segments, dot_seconds, EncoderStage::StationId);
+            }
+            push_tone(
+                segments,
+                tone_hz,
+                if symbol == b'-' {
+                    dot_seconds * 3.0
+                } else {
+                    dot_seconds
+                },
+                EncoderStage::StationId,
+                true,
+            );
+        }
+    }
+}
+
+fn callsign_morse(character: char) -> &'static str {
+    match character {
+        'A' => ".-",
+        'B' => "-...",
+        'C' => "-.-.",
+        'D' => "-..",
+        'E' => ".",
+        'F' => "..-.",
+        'G' => "--.",
+        'H' => "....",
+        'I' => "..",
+        'J' => ".---",
+        'K' => "-.-",
+        'L' => ".-..",
+        'M' => "--",
+        'N' => "-.",
+        'O' => "---",
+        'P' => ".--.",
+        'Q' => "--.-",
+        'R' => ".-.",
+        'S' => "...",
+        'T' => "-",
+        'U' => "..-",
+        'V' => "...-",
+        'W' => ".--",
+        'X' => "-..-",
+        'Y' => "-.--",
+        'Z' => "--..",
+        '0' => "-----",
+        '1' => ".----",
+        '2' => "..---",
+        '3' => "...--",
+        '4' => "....-",
+        '5' => ".....",
+        '6' => "-....",
+        '7' => "--...",
+        '8' => "---..",
+        '9' => "----.",
+        '/' => "-..-.",
+        _ => unreachable!("callsign validation rejects unsupported characters"),
+    }
+}
+
+fn push_tone(
+    segments: &mut VecDeque<QueuedSegment>,
+    frequency_hz: f64,
+    seconds: f64,
+    stage: EncoderStage,
+    ramped: bool,
+) {
+    segments.push_back(QueuedSegment {
+        frequency_hz: Some(frequency_hz),
+        seconds,
+        ramp_seconds: if ramped { CW_RAMP_SECONDS } else { 0.0 },
+        stage,
+    });
+}
+
+fn push_silence(segments: &mut VecDeque<QueuedSegment>, seconds: f64, stage: EncoderStage) {
+    if seconds > 0.0 {
+        segments.push_back(QueuedSegment {
+            frequency_hz: None,
+            seconds,
+            ramp_seconds: 0.0,
+            stage,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +1140,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fsk_id_uses_dl3yap_marker_and_callsign_checksum() {
+        let envelope = SstvTransmissionEnvelope {
+            station_id: SstvStationId::Fsk {
+                callsign: "A".to_owned(),
+            },
+            ..SstvTransmissionEnvelope::default()
+        };
+        let segments = build_trailer(&envelope).into_iter().collect::<Vec<_>>();
+        assert_eq!(segments[0].frequency_hz, Some(1500.0));
+        assert_eq!(segments[1].frequency_hz, Some(2100.0));
+        assert_eq!(segments[2].frequency_hz, Some(1900.0));
+        let bits = |offset: usize| {
+            segments[offset..offset + 6]
+                .iter()
+                .map(|segment| segment.frequency_hz == Some(1900.0))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(3), [false, true, false, true, false, true]);
+        assert_eq!(bits(9), [true, false, false, false, false, true]);
+        assert_eq!(bits(21), [true, false, false, false, false, true]);
+    }
+
+    #[test]
+    fn cw_id_uses_paris_timing_and_ramped_tones() {
+        let envelope = SstvTransmissionEnvelope {
+            station_id: SstvStationId::Cw {
+                callsign: "ET".to_owned(),
+                wpm: 20,
+                tone_hz: 800.0,
+            },
+            ..SstvTransmissionEnvelope::default()
+        };
+        let segments = build_trailer(&envelope).into_iter().collect::<Vec<_>>();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].seconds, 0.060);
+        assert_eq!(segments[0].ramp_seconds, 0.003);
+        assert_eq!(segments[1].frequency_hz, None);
+        assert_eq!(segments[1].seconds, 0.180);
+        assert!((segments[2].seconds - 0.180).abs() < f64::EPSILON);
     }
 }

@@ -26,7 +26,10 @@ pub use decoder::{
     AbortReason, DecodeEvent, DecodeEventRef, DecodeSink, DecoderConfig, DetectionSource,
     LineCompleteness, ProcessReport, SstvDecoder, SyncState,
 };
-pub use encoder::{EncodeOptions, EncoderProgress, SstvEncoder};
+pub use encoder::{
+    EncodeOptions, EncoderProgress, EncoderStage, SstvEncoder, SstvStationId,
+    SstvTransmissionEnvelope,
+};
 pub use error::{Error, Result};
 pub use fax_paper::{
     FaxPaperConfig, FaxPaperDecoder, FaxPaperEvent, FaxPaperEventRef, FaxPaperMode, FaxPaperSink,

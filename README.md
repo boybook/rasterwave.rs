@@ -81,7 +81,7 @@ Or declare the dependency directly:
 
 ```toml
 [dependencies]
-rasterwave = "0.2"
+rasterwave = "0.4"
 ```
 
 The minimum supported Rust version is 1.85.
@@ -113,6 +113,45 @@ fn encode(mut write_audio: impl FnMut(&[f32])) -> rasterwave::Result<()> {
 
 Segment deadlines accumulate on one continuous sample timeline. Rounding error
 is bounded to one sample over a complete transmission, including at 44.1 kHz.
+
+### Optional transmission envelope
+
+`SstvEncoder::new()` always keeps the interoperable 910 ms VIS header enabled
+by default and ends at the last raster sample. Applications that key a radio can
+opt into an enhanced calibration preamble, FSK or CW station identification,
+and a final keyed-transmitter guard without assembling PCM in another thread:
+
+```rust
+use rasterwave::{
+    EncodeOptions, Rgb, RgbImage, SstvEncoder, SstvMode, SstvStationId,
+    SstvTransmissionEnvelope,
+};
+
+let mode = SstvMode::Robot36;
+let spec = mode.spec();
+let image = RgbImage::filled(spec.width, spec.height, Rgb::new(32, 128, 224));
+let mut encoder = SstvEncoder::new_with_envelope(
+    image,
+    mode,
+    48_000,
+    EncodeOptions::default(),
+    SstvTransmissionEnvelope {
+        enhanced_preamble: true,
+        station_id: SstvStationId::Fsk { callsign: "N0CALL".into() },
+        post_image_gap_seconds: 0.5,
+        end_guard_seconds: 0.3,
+    },
+)?;
+
+let raster_end = encoder.progress().raster_end_sample;
+```
+
+The enhanced preamble is the eight 100 ms calibration tones used by QSSTV,
+followed by the ordinary VIS header. FSK ID uses the interoperable DL3YAP
+6-bit callsign framing. CW accepts 5-60 WPM and 400-2300 Hz. Callsigns are
+uppercase `A-Z`, `0-9`, or `/`, up to 16 characters. `raster_start_sample` and
+`raster_end_sample` are exact positions in the emitted stream, so monitoring
+applications can decode the image without treating the station ID as pixels.
 
 ## Streaming SSTV Decode
 

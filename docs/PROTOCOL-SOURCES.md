@@ -25,6 +25,10 @@ claim that every third-party implementation uses identical timing.
   `b3747964d8b3599c7f2236717f3e6519b57a5dd86942b7f509478efcbf616d49`
 - Martin Bruchanov, OK2MNM, *Image Communication on Short Waves*:
   <https://www.sstv-handbook.com/>
+- QSSTV transmission sequencing and DL3YAP FSK-ID interoperability reference:
+  <https://github.com/ON4QZ/QSSTV/blob/main/src/sstv/sstvtx.cpp>
+- Robot36 companion encoder reference for the baseline 910 ms VIS header:
+  <https://github.com/xdsopl/SSTVEncoder2/blob/master/app/src/main/java/om/sstvencoder/Modes/Mode.java>
 
 The Dayton document is a proposal, not a formal standards-body publication.
 It remains the strongest first-party engineering source for Robot 1200C

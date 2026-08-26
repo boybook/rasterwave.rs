@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-26
+
+- Add an opt-in SSTV transmission envelope with QSSTV-compatible calibration
+  tones, DL3YAP FSK ID, audible CW callsign ID, and end-guard silence.
+- Report encoder stage and exact raster sample boundaries while preserving the
+  legacy constructor's sample-identical output.
+
 ## 0.3.1 - 2026-08-26
 
 - Jointly search radiofax dead-sector phase and clock ppm on a circular 64-line
