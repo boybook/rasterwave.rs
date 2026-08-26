@@ -235,8 +235,8 @@ fn image_dead_sector_recovers_midstream_horizontal_phase() {
     let spec = FaxSpec::standard(FaxIoc::Ioc288, FaxLpm::LPM_240);
     let image = GrayImage::new(
         spec.active_width(),
-        96,
-        vec![128; spec.active_width() as usize * 96],
+        160,
+        vec![128; spec.active_width() as usize * 160],
     )
     .unwrap();
     let mut encoder = FaxEncoder::new(

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-08-26
+
+- Jointly search radiofax dead-sector phase and clock ppm on a circular 64-line
+  window, including 1 ppm refinement for small full-page slant.
+- Require multiple time-consistent image windows before publishing a
+  calibration point, preventing isolated map features from moving a segment.
+- Use trusted phasing as a horizontal prior while allowing the image tracker
+  to correct residual clock error throughout a transmission.
+- Reject structureless input before the expensive search and narrow later
+  searches around the established clock to keep continuous receive bounded.
+
 ## 0.3.0 - 2026-08-25
 
 - Recover radiofax line period and horizontal phase with robust phasing

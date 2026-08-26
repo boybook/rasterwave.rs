@@ -352,13 +352,32 @@ struct Capture {
     spec: FaxSpec,
 }
 
-const DEAD_SECTOR_TRACKING_LINES: usize = 32;
-const DEAD_SECTOR_TRACKING_STRIDE: u64 = 8;
+const DEAD_SECTOR_TRACKING_LINES: usize = 64;
+const DEAD_SECTOR_TRACKING_STRIDE: u64 = 32;
+const DEAD_SECTOR_MAX_PPM: i32 = 5_000;
+const DEAD_SECTOR_COARSE_PPM_STEP: i32 = 100;
+const DEAD_SECTOR_FINE_PPM_STEP: i32 = 10;
+const DEAD_SECTOR_ULTRA_FINE_PPM_STEP: i32 = 1;
+
+#[derive(Clone, Copy, Debug)]
+struct DeadSectorCandidate {
+    sector_start: usize,
+    clock_ppm: f64,
+    score: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeadSectorMeasurement {
+    reference_line: u64,
+    phase_pixels: f64,
+    clock_ppm: f64,
+    confidence: f64,
+}
 
 #[derive(Debug, Default)]
 struct DeadSectorClockTracker {
     rows: std::collections::VecDeque<(u64, Vec<u8>)>,
-    measurements: std::collections::VecDeque<(u64, f64)>,
+    measurements: std::collections::VecDeque<DeadSectorMeasurement>,
     revision: u32,
     last_emitted: Option<FaxClockCalibrationPoint>,
 }
@@ -391,48 +410,100 @@ impl DeadSectorClockTracker {
         }
         let width = spec.width() as usize;
         let sector = width.saturating_sub(spec.active_width() as usize).max(1);
-        let mut sums = vec![0.0_f64; width];
-        let mut squares = vec![0.0_f64; width];
+        let mut minimum = u8::MAX;
+        let mut maximum = u8::MIN;
         for (_, row) in &self.rows {
-            for (column, value) in row.iter().copied().enumerate() {
-                let value = f64::from(value);
-                sums[column] += value;
-                squares[column] += value * value;
+            for value in row.iter().copied() {
+                minimum = minimum.min(value);
+                maximum = maximum.max(value);
             }
         }
-        let count = self.rows.len() as f64;
-        let mut scores = vec![0.0_f64; width - sector + 1];
-        let mut score = 0.0;
-        for column in 0..sector {
-            score += column_score(sums[column], squares[column], count);
+        if maximum.saturating_sub(minimum) < 40 {
+            return None;
         }
-        scores[0] = score / sector as f64;
-        for start in 1..scores.len() {
-            score += column_score(sums[start + sector - 1], squares[start + sector - 1], count)
-                - column_score(sums[start - 1], squares[start - 1], count);
-            scores[start] = score / sector as f64;
+        let prior_sector_start = self.last_emitted.map(|previous| {
+            let predicted_phase = f64::from(previous.phase_pixels)
+                + line_index.saturating_sub(previous.reference_line) as f64
+                    * f64::from(previous.clock_ppm)
+                    * width as f64
+                    / 1_000_000.0;
+            wrap_column(
+                (f64::from(spec.active_width()) - predicted_phase).round() as i64,
+                width,
+            )
+        });
+        let mut candidates = Vec::new();
+        let has_tracking_lock = self
+            .last_emitted
+            .is_some_and(|point| point.source == crate::fax::FaxClockSource::DeadSector);
+        let (coarse_start, coarse_end, coarse_step) = if has_tracking_lock {
+            let previous = self.last_emitted.expect("tracking lock exists");
+            let center = previous.clock_ppm.round() as i32;
+            (
+                (center - 250).max(-DEAD_SECTOR_MAX_PPM),
+                (center + 250).min(DEAD_SECTOR_MAX_PPM),
+                25,
+            )
+        } else {
+            (
+                -DEAD_SECTOR_MAX_PPM,
+                DEAD_SECTOR_MAX_PPM,
+                DEAD_SECTOR_COARSE_PPM_STEP,
+            )
+        };
+        for ppm in (coarse_start..=coarse_end).step_by(coarse_step as usize) {
+            candidates.extend(self.evaluate_clock(spec, f64::from(ppm), false, prior_sector_start));
         }
-        let (best_start, best_score) = scores
+        let coarse = candidates
             .iter()
             .copied()
-            .enumerate()
-            .max_by(|left, right| left.1.total_cmp(&right.1))?;
-        let second_score = scores
+            .max_by(|left, right| left.score.total_cmp(&right.score))?;
+        candidates.clear();
+        let fine_radius = if has_tracking_lock {
+            25
+        } else {
+            DEAD_SECTOR_COARSE_PPM_STEP
+        };
+        let fine_step = if has_tracking_lock {
+            5
+        } else {
+            DEAD_SECTOR_FINE_PPM_STEP
+        };
+        let fine_start = (coarse.clock_ppm as i32 - fine_radius).max(-DEAD_SECTOR_MAX_PPM);
+        let fine_end = (coarse.clock_ppm as i32 + fine_radius).min(DEAD_SECTOR_MAX_PPM);
+        for ppm in (fine_start..=fine_end).step_by(fine_step as usize) {
+            candidates.extend(self.evaluate_clock(spec, f64::from(ppm), false, prior_sector_start));
+        }
+        let fine = candidates
             .iter()
             .copied()
-            .enumerate()
-            .filter(|(start, _)| start.abs_diff(best_start) >= sector)
-            .map(|(_, score)| score)
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0);
-        let strength = (best_score / 127.5).clamp(0.0, 1.0);
-        let uniqueness = ((best_score - second_score) / best_score.abs().max(1.0)).clamp(0.0, 1.0);
-        let confidence = (strength * 0.55 + uniqueness * 0.45) as f32;
-        if confidence < 0.55 {
+            .max_by(|left, right| left.score.total_cmp(&right.score))?;
+        candidates.clear();
+        let ultra_radius = if has_tracking_lock {
+            5
+        } else {
+            DEAD_SECTOR_FINE_PPM_STEP
+        };
+        let ultra_start = (fine.clock_ppm as i32 - ultra_radius).max(-DEAD_SECTOR_MAX_PPM);
+        let ultra_end = (fine.clock_ppm as i32 + ultra_radius).min(DEAD_SECTOR_MAX_PPM);
+        for ppm in (ultra_start..=ultra_end).step_by(DEAD_SECTOR_ULTRA_FINE_PPM_STEP as usize) {
+            candidates.extend(self.evaluate_clock(spec, f64::from(ppm), true, prior_sector_start));
+        }
+        candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+        let best = *candidates.first()?;
+        let second = candidates.iter().copied().find(|candidate| {
+            circular_distance(candidate.sector_start, best.sector_start, width) >= sector / 2
+                || (candidate.clock_ppm - best.clock_ppm).abs() >= 250.0
+        });
+        let strength = best.score.clamp(0.0, 1.0);
+        let second_score = second.map_or(0.0, |candidate| candidate.score);
+        let uniqueness = ((best.score - second_score) / best.score.abs().max(0.01)).clamp(0.0, 1.0);
+        let confidence = strength * 0.72 + uniqueness * 0.28;
+        if confidence < 0.47 {
             return None;
         }
         let desired = spec.active_width() as f64;
-        let mut phase = desired - best_start as f64;
+        let mut phase = desired - best.sector_start as f64;
         let half = width as f64 * 0.5;
         while phase > half {
             phase -= width as f64;
@@ -440,35 +511,103 @@ impl DeadSectorClockTracker {
         while phase < -half {
             phase += width as f64;
         }
-        if let Some((_, previous)) = self.measurements.back().copied() {
-            while phase - previous > half {
+        let continuity = self
+            .measurements
+            .back()
+            .map(|measurement| {
+                measurement.phase_pixels
+                    + line_index.saturating_sub(measurement.reference_line) as f64
+                        * measurement.clock_ppm
+                        * width as f64
+                        / 1_000_000.0
+            })
+            .or_else(|| {
+                self.last_emitted.map(|previous| {
+                    f64::from(previous.phase_pixels)
+                        + line_index.saturating_sub(previous.reference_line) as f64
+                            * f64::from(previous.clock_ppm)
+                            * width as f64
+                            / 1_000_000.0
+                })
+            });
+        if let Some(predicted) = continuity {
+            while phase - predicted > half {
                 phase -= width as f64;
             }
-            while phase - previous < -half {
+            while phase - predicted < -half {
                 phase += width as f64;
             }
         }
-        self.measurements.push_back((line_index, phase));
-        while self.measurements.len() > 16 {
+        self.measurements.push_back(DeadSectorMeasurement {
+            reference_line: line_index,
+            phase_pixels: phase,
+            clock_ppm: best.clock_ppm,
+            confidence,
+        });
+        while self.measurements.len() > 5 {
             self.measurements.pop_front();
         }
-        let mut slopes = Vec::new();
-        for (index, left) in self.measurements.iter().enumerate() {
-            for right in self.measurements.iter().skip(index + 1) {
-                let lines = right.0.saturating_sub(left.0);
-                if lines > 0 {
-                    slopes.push((right.1 - left.1) / lines as f64);
-                }
+        if self.measurements.len() < 3 {
+            return None;
+        }
+        let mut ppm_values: Vec<_> = self
+            .measurements
+            .iter()
+            .map(|measurement| measurement.clock_ppm)
+            .collect();
+        let clock_ppm = median_value(&mut ppm_values)?;
+        let mut projected_phases: Vec<_> = self
+            .measurements
+            .iter()
+            .map(|measurement| {
+                measurement.phase_pixels
+                    + line_index.saturating_sub(measurement.reference_line) as f64
+                        * measurement.clock_ppm
+                        * width as f64
+                        / 1_000_000.0
+            })
+            .collect();
+        let phase_anchor = *projected_phases.last()?;
+        for projected in &mut projected_phases {
+            while *projected - phase_anchor > half {
+                *projected -= width as f64;
+            }
+            while *projected - phase_anchor < -half {
+                *projected += width as f64;
             }
         }
-        slopes.sort_by(f64::total_cmp);
-        let slope = slopes.get(slopes.len() / 2).copied().unwrap_or(0.0);
-        let clock_ppm = (slope / width as f64 * 1_000_000.0) as f32;
+        phase = median_value(&mut projected_phases)?;
+        let mut ppm_deviations: Vec<_> = self
+            .measurements
+            .iter()
+            .map(|measurement| (measurement.clock_ppm - clock_ppm).abs())
+            .collect();
+        let mut phase_deviations: Vec<_> = projected_phases
+            .iter()
+            .map(|projected| (*projected - phase).abs())
+            .collect();
+        let ppm_mad = median_value(&mut ppm_deviations).unwrap_or(f64::INFINITY);
+        let phase_mad = median_value(&mut phase_deviations).unwrap_or(f64::INFINITY);
+        if ppm_mad > 60.0 || phase_mad > (sector as f64 * 0.15).max(4.0) {
+            return None;
+        }
+        let mean_confidence = self
+            .measurements
+            .iter()
+            .map(|measurement| measurement.confidence)
+            .sum::<f64>()
+            / self.measurements.len() as f64;
+        let consistency = (1.0 - ppm_mad / 60.0).clamp(0.0, 1.0) * 0.5
+            + (1.0 - phase_mad / (sector as f64 * 0.15).max(4.0)).clamp(0.0, 1.0) * 0.5;
+        let confidence = (mean_confidence * 0.75 + consistency * 0.25) as f32;
+        if confidence < 0.58 {
+            return None;
+        }
         let point = FaxClockCalibrationPoint {
             revision: self.revision.saturating_add(1),
             reference_line: line_index,
             phase_pixels: phase as f32,
-            clock_ppm,
+            clock_ppm: clock_ppm as f32,
             confidence,
             source: crate::fax::FaxClockSource::DeadSector,
             status: crate::fax::FaxClockStatus::Tracking,
@@ -484,12 +623,135 @@ impl DeadSectorClockTracker {
         self.last_emitted = Some(point);
         Some(point)
     }
+
+    fn evaluate_clock(
+        &self,
+        spec: FaxSpec,
+        correction_ppm: f64,
+        interpolate: bool,
+        prior_sector_start: Option<usize>,
+    ) -> [DeadSectorCandidate; 2] {
+        let width = spec.width() as usize;
+        let sector = width.saturating_sub(spec.active_width() as usize).max(1);
+        let reference_line = self.rows.back().map_or(0, |(line, _)| *line);
+        let mut sums = vec![0.0_f64; width];
+        let mut squares = vec![0.0_f64; width];
+        for (line, row) in &self.rows {
+            let delta = *line as f64 - reference_line as f64;
+            let shift = correction_ppm * width as f64 * delta / 1_000_000.0;
+            for column in 0..width {
+                let source = column as f64 - shift;
+                let left_unwrapped = source.floor();
+                let fraction = source - left_unwrapped;
+                let left = wrap_column(left_unwrapped as i64, width);
+                let value = if interpolate {
+                    let right = (left + 1) % width;
+                    f64::from(row[left]) + (f64::from(row[right]) - f64::from(row[left])) * fraction
+                } else {
+                    f64::from(row[wrap_column(source.round() as i64, width)])
+                };
+                sums[column] += value;
+                squares[column] += value * value;
+            }
+        }
+        let count = self.rows.len() as f64;
+        let means: Vec<_> = sums.iter().map(|sum| *sum / count).collect();
+        let column_scores: Vec<_> = sums
+            .iter()
+            .zip(&squares)
+            .map(|(sum, square)| column_score(*sum, *square, count))
+            .collect();
+        let mean_prefix = circular_prefix(&means);
+        let mean_square_prefix =
+            circular_prefix(&means.iter().map(|value| value * value).collect::<Vec<_>>());
+        let score_prefix = circular_prefix(&column_scores);
+        let edge = (sector / 4).max(4);
+        let mut scored = Vec::with_capacity(width);
+        for start in 0..width {
+            let band_score = window_sum(&score_prefix, start, sector) / sector as f64;
+            let band_mean = window_sum(&mean_prefix, start, sector) / sector as f64;
+            let band_square = window_sum(&mean_square_prefix, start, sector) / sector as f64;
+            let spatial_variance = (band_square - band_mean * band_mean).max(0.0);
+            let uniformity = (1.0 - spatial_variance.sqrt() / 96.0).clamp(0.0, 1.0);
+            let before = window_sum(&mean_prefix, start + width - edge, edge) / edge as f64;
+            let after = window_sum(&mean_prefix, start + sector, edge) / edge as f64;
+            let edge_contrast =
+                (((band_mean - before).abs() + (band_mean - after).abs()) / 510.0).clamp(0.0, 1.0);
+            let evidence =
+                (band_score * 0.62 + uniformity * 0.13 + edge_contrast * 0.25).clamp(0.0, 1.0);
+            let score = if let Some(prior) = prior_sector_start {
+                let alignment = (1.0
+                    - circular_distance(start, prior, width) as f64 / (sector * 3) as f64)
+                    .clamp(0.0, 1.0);
+                evidence * 0.82 + alignment * 0.18
+            } else {
+                evidence
+            };
+            scored.push((start, score));
+        }
+        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
+        let best = scored[0];
+        let second = scored
+            .iter()
+            .copied()
+            .find(|candidate| circular_distance(candidate.0, best.0, width) >= sector / 2)
+            .unwrap_or(best);
+        [
+            DeadSectorCandidate {
+                sector_start: best.0,
+                clock_ppm: correction_ppm,
+                score: best.1,
+            },
+            DeadSectorCandidate {
+                sector_start: second.0,
+                clock_ppm: correction_ppm,
+                score: second.1,
+            },
+        ]
+    }
 }
 
 fn column_score(sum: f64, squares: f64, count: f64) -> f64 {
     let mean = sum / count;
     let variance = (squares / count - mean * mean).max(0.0);
-    (mean - 127.5).abs() - variance.sqrt() * 1.5
+    let extreme = ((mean - 127.5).abs() / 127.5).clamp(0.0, 1.0);
+    let stability = (1.0 - variance.sqrt() / 96.0).clamp(0.0, 1.0);
+    extreme * 0.58 + stability * 0.42
+}
+
+fn circular_prefix(values: &[f64]) -> Vec<f64> {
+    let mut prefix = Vec::with_capacity(values.len() * 2 + 1);
+    prefix.push(0.0);
+    for value in values.iter().chain(values) {
+        prefix.push(prefix.last().copied().unwrap_or(0.0) + value);
+    }
+    prefix
+}
+
+fn window_sum(prefix: &[f64], start: usize, length: usize) -> f64 {
+    prefix[start + length] - prefix[start]
+}
+
+fn wrap_column(column: i64, width: usize) -> usize {
+    column.rem_euclid(width as i64) as usize
+}
+
+fn circular_distance(left: usize, right: usize, width: usize) -> usize {
+    let direct = left.abs_diff(right);
+    direct.min(width.saturating_sub(direct))
+}
+
+fn median_value(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    })
 }
 
 /// Continuous radiofax raster with parallel APT/phasing acquisition.
@@ -960,4 +1222,46 @@ fn same_decode_spec(left: FaxSpec, right: FaxSpec) -> bool {
     left.ioc == right.ioc
         && left.lpm == right.lpm
         && modulation_kind(left.modulation) == modulation_kind(right.modulation)
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn joint_dead_sector_search_recovers_midstream_phase_and_small_clock_error() {
+        let spec = FaxSpec::standard(FaxIoc::Ioc288, FaxLpm::LPM_120);
+        let width = spec.width() as usize;
+        let sector = width - spec.active_width() as usize;
+        let base_phase = 230.0_f64;
+        let expected_ppm = 37.0_f64;
+        let mut tracker = DeadSectorClockTracker::default();
+        let mut latest = None;
+        for line in 0..160_u64 {
+            let mut row = vec![0_u8; width];
+            for (column, value) in row.iter_mut().enumerate() {
+                *value = 72 + ((column as u64 * 17 + line * 29) % 144) as u8;
+            }
+            let correction = base_phase + line as f64 * expected_ppm * width as f64 / 1_000_000.0;
+            let observed = wrap_column(
+                (f64::from(spec.active_width()) - correction).round() as i64,
+                width,
+            );
+            for offset in 0..sector {
+                row[(observed + offset) % width] = (line % 3) as u8;
+            }
+            latest = tracker.observe(line, spec, &row).or(latest);
+        }
+        let point = latest.expect("dead-sector calibration");
+        let expected_phase =
+            base_phase + point.reference_line as f64 * expected_ppm * width as f64 / 1_000_000.0;
+        assert!(
+            (f64::from(point.phase_pixels) - expected_phase).abs() <= 3.0,
+            "point={point:?}, expected_phase={expected_phase}"
+        );
+        assert!(
+            (f64::from(point.clock_ppm) - expected_ppm).abs() <= 6.0,
+            "point={point:?}"
+        );
+    }
 }
